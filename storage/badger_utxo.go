@@ -1,0 +1,157 @@
+package storage
+
+import (
+	"fmt"
+
+	"github.com/MixinNetwork/mixin/common"
+	"github.com/MixinNetwork/mixin/crypto"
+	"github.com/dgraph-io/badger/v4"
+)
+
+func (s *BadgerStore) ReadUTXOKeys(hash crypto.Hash, index uint) (*common.UTXOKeys, error) {
+	txn := s.snapshotsDB.NewTransaction(false)
+	defer txn.Discard()
+
+	utxo, err := s.readUTXOLock(txn, hash, index)
+	if err != nil || utxo == nil {
+		return nil, err
+	}
+	return &common.UTXOKeys{
+		Mask: utxo.Mask,
+		Keys: utxo.Keys,
+	}, nil
+}
+
+func (s *BadgerStore) ReadUTXOLock(hash crypto.Hash, index uint) (*common.UTXOWithLock, error) {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+
+	txn := s.snapshotsDB.NewTransaction(false)
+	defer txn.Discard()
+
+	return s.readUTXOLock(txn, hash, index)
+}
+
+func (s *BadgerStore) readUTXOLock(txn *badger.Txn, hash crypto.Hash, index uint) (*common.UTXOWithLock, error) {
+	key := graphUtxoKey(hash, index)
+	item, err := txn.Get(key)
+	if err == badger.ErrKeyNotFound {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	ival, err := item.ValueCopy(nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return common.UnmarshalUTXO(ival)
+}
+
+func (s *BadgerStore) LockUTXOs(inputs []*common.Input, tx crypto.Hash, fork bool) error {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	return s.snapshotsDB.Update(func(txn *badger.Txn) error {
+		return lockUTXOs(txn, inputs, tx, fork)
+	})
+}
+
+func lockUTXOs(txn *badger.Txn, inputs []*common.Input, tx crypto.Hash, fork bool) error {
+	for _, in := range inputs {
+		err := lockUTXO(txn, in.Hash, in.Index, tx, fork)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func lockUTXO(txn *badger.Txn, hash crypto.Hash, index uint, tx crypto.Hash, fork bool) error {
+	key := graphUtxoKey(hash, index)
+	item, err := txn.Get(key)
+	if err != nil {
+		return err
+	}
+	ival, err := item.ValueCopy(nil)
+	if err != nil {
+		return err
+	}
+
+	out, err := common.UnmarshalUTXO(ival)
+	if err != nil {
+		return err
+	}
+
+	if out.LockHash.HasValue() && out.LockHash != tx {
+		if !fork {
+			return fmt.Errorf("utxo locked for transaction %s", out.LockHash)
+		}
+		err := pruneTransaction(txn, out.LockHash)
+		if err != nil {
+			return err
+		}
+	}
+	out.LockHash = tx
+	return txn.Set(key, out.Marshal())
+}
+
+func (s *BadgerStore) ReadGhostKeyLock(key crypto.Key) (*crypto.Hash, error) {
+	txn := s.snapshotsDB.NewTransaction(false)
+	defer txn.Discard()
+
+	item, err := txn.Get(graphGhostKey(key))
+	if err == badger.ErrKeyNotFound {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var by crypto.Hash
+	_, err = item.ValueCopy(by[:])
+	return &by, err
+}
+
+func (s *BadgerStore) LockGhostKeys(keys []*crypto.Key, tx crypto.Hash, fork bool) error {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	return s.snapshotsDB.Update(func(txn *badger.Txn) error {
+		filter := make(map[crypto.Key]bool)
+		for _, ghost := range keys {
+			if filter[*ghost] {
+				return fmt.Errorf("duplicated ghost key %s", ghost.String())
+			}
+			filter[*ghost] = true
+			err := lockGhostKey(txn, ghost, tx)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func lockGhostKey(txn *badger.Txn, ghost *crypto.Key, tx crypto.Hash) error {
+	key := graphGhostKey(*ghost)
+	item, err := txn.Get(key)
+	if err == badger.ErrKeyNotFound {
+		return txn.Set(key, tx[:])
+	}
+	if err != nil {
+		return err
+	}
+	var by crypto.Hash
+	val, err := item.ValueCopy(by[:])
+	if err != nil {
+		return err
+	}
+	if len(val) != len(by) || !by.HasValue() {
+		return fmt.Errorf("ghost key %s malformed lock %x", ghost.String(), val)
+	}
+	if by != tx {
+		return fmt.Errorf("ghost key %s locked for transaction %s", ghost.String(), by.String())
+	}
+	return nil
+}

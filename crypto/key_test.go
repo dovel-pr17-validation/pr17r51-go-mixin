@@ -1,0 +1,65 @@
+package crypto
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/require"
+)
+
+func TestKeySerializationRoundTrip(t *testing.T) {
+	require := require.New(t)
+	seed := make([]byte, 64)
+	for i := range seed {
+		seed[i] = byte(i + 1)
+	}
+	key := NewKeyFromSeed(seed)
+	require.Equal("c91e0907d114fd83c1edc396490bb2dafa43c19815b0354e70dc80c317c3cb0a", key.String())
+	require.Equal("36bb0e309e7e9a82f1527df2c6b0e48181589097fe90c1282c558207ea27ce66", key.Public().String())
+
+	j, err := key.MarshalJSON()
+	require.Nil(err)
+	require.Equal("\"c91e0907d114fd83c1edc396490bb2dafa43c19815b0354e70dc80c317c3cb0a\"", string(j))
+	var decoded Key
+	err = decoded.UnmarshalJSON(j)
+	require.Nil(err)
+	require.Equal(key, decoded)
+	require.Equal("36bb0e309e7e9a82f1527df2c6b0e48181589097fe90c1282c558207ea27ce66", decoded.Public().String())
+}
+
+func TestGhostKey(t *testing.T) {
+	require := require.New(t)
+	a := randomKey()
+	A := a.Public()
+	b := randomKey()
+	B := b.Public()
+	r := randomKey()
+	R := r.Public()
+
+	P := DeriveGhostPublicKey(&r, &A, &B, 0)
+	p := DeriveGhostPrivateKey(&A, &b, &r, 0)
+	require.NotEqual(*P, p.Public())
+	p = DeriveGhostPrivateKey(&B, &r, &a, 0)
+	require.NotEqual(*P, p.Public())
+	p = DeriveGhostPrivateKey(&B, &a, &r, 0)
+	require.NotEqual(*P, p.Public())
+	p = DeriveGhostPrivateKey(&A, &r, &b, 0)
+	require.Equal(*P, p.Public())
+	p = DeriveGhostPrivateKey(&R, &a, &b, 0)
+	require.Equal(*P, p.Public())
+
+	O := ViewGhostOutputKey(P, &a, &R, 0)
+	require.Equal(*O, B)
+
+	ah := Blake3Hash(a[:])
+	sig := p.Sign(ah)
+	require.True(P.Verify(ah, sig))
+
+	sig = a.Sign(ah)
+	require.True(A.Verify(ah, sig))
+}
+
+func randomKey() Key {
+	seed := make([]byte, 64)
+	ReadRand(seed)
+	return NewKeyFromSeed(seed)
+}

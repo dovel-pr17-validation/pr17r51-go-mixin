@@ -1,0 +1,605 @@
+package kernel
+
+import (
+	"fmt"
+	"slices"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/MixinNetwork/mixin/common"
+	"github.com/MixinNetwork/mixin/config"
+	"github.com/MixinNetwork/mixin/crypto"
+	"github.com/MixinNetwork/mixin/kernel/internal"
+	"github.com/MixinNetwork/mixin/kernel/internal/clock"
+	"github.com/MixinNetwork/mixin/logger"
+	"github.com/MixinNetwork/mixin/storage"
+)
+
+const (
+	FinalPoolSlotsLimit     = config.SnapshotSyncRoundThreshold * 8
+	FinalPoolRoundSizeLimit = 1024
+	CachePoolSnapshotsLimit = 256
+)
+
+type PeerSnapshot struct {
+	Snapshot  *common.Snapshot
+	peers     []crypto.Hash
+	filter    map[crypto.Hash]bool
+	finalized bool
+}
+
+type ChainRound struct {
+	Number    uint64
+	Size      int
+	Timestamp uint64
+	Snapshots [FinalPoolRoundSizeLimit]*PeerSnapshot
+	index     map[crypto.Hash]int
+}
+
+type ChainState struct {
+	CacheRound   *CacheRound
+	FinalRound   *FinalRound
+	RoundHistory []*FinalRound
+	RoundLinks   map[crypto.Hash]uint64
+}
+
+type ActionBuffer chan *CosiAction
+
+type Chain struct {
+	sync.RWMutex
+	node          *Node
+	ChainId       crypto.Hash
+	ConsensusInfo *CNode
+
+	State *ChainState
+
+	graphSnapshot atomic.Pointer[chainGraphSnapshot]
+
+	CosiRandoms          map[crypto.CosiCommitment]*crypto.CosiNonce
+	UsedRandoms          map[crypto.Hash]*crypto.CosiNonce
+	usedRandomsOrder     []crypto.Hash
+	CosiCommitments      map[crypto.Hash][]*crypto.CosiCommitment
+	UsedCommitments      map[crypto.CosiCommitment]bool
+	usedCommitmentsOrder []crypto.CosiCommitment
+	CommitmentsSentTime  time.Time
+	CosiCommunicatedAt   map[crypto.Hash]time.Time
+
+	CosiAggregators map[crypto.Hash]*CosiAggregator
+	CosiVerifiers   map[crypto.Hash]*CosiVerifier
+	CachePool       ActionBuffer
+	FinalPool       [FinalPoolSlotsLimit]*ChainRound
+	FinalIndex      int
+	FinalCount      int
+
+	persistStore     storage.Store
+	finalActionsRing ActionBuffer
+	cosiWake         chan struct{}
+	finalPoolDirty   atomic.Bool
+	lastFinalCheck   time.Time
+	plc              chan struct{}
+	clc              chan struct{}
+	wlc              chan struct{}
+	slc              chan struct{}
+	running          atomic.Bool
+	loopsStarted     bool
+	tornDown         bool
+}
+
+func (node *Node) buildChain(chainId crypto.Hash) *Chain {
+	logger.Printf("node.buildChain(%s)", chainId)
+
+	chain := &Chain{
+		node:               node,
+		ChainId:            chainId,
+		CosiRandoms:        make(map[crypto.CosiCommitment]*crypto.CosiNonce),
+		UsedRandoms:        make(map[crypto.Hash]*crypto.CosiNonce),
+		CosiCommitments:    make(map[crypto.Hash][]*crypto.CosiCommitment),
+		UsedCommitments:    make(map[crypto.CosiCommitment]bool),
+		CosiCommunicatedAt: make(map[crypto.Hash]time.Time),
+		CosiAggregators:    make(map[crypto.Hash]*CosiAggregator),
+		CosiVerifiers:      make(map[crypto.Hash]*CosiVerifier),
+		CachePool:          make(chan *CosiAction, CachePoolSnapshotsLimit),
+		persistStore:       node.persistStore,
+		finalActionsRing:   make(chan *CosiAction, FinalPoolSlotsLimit),
+		cosiWake:           make(chan struct{}, 1),
+		plc:                make(chan struct{}),
+		clc:                make(chan struct{}),
+		wlc:                make(chan struct{}),
+		slc:                make(chan struct{}),
+	}
+
+	err := chain.loadState()
+	if err != nil {
+		panic(err)
+	}
+	return chain
+}
+
+func (chain *Chain) bootLoops() {
+	chain.Lock()
+	defer chain.Unlock()
+
+	// A chain must never restart its loops once the node is shutting down:
+	// late messages, e.g. delayed node accept finalizations, may still
+	// arrive and call BootChain after node.done is closed but before every
+	// chain's Teardown has begun. Restarting the loops in that window would
+	// close the loop exit channels a second time and panic.
+	select {
+	case <-chain.node.done:
+		return
+	default:
+	}
+	if chain.running.Load() || chain.loopsStarted || chain.tornDown {
+		return
+	}
+
+	rn := chain.node.GetRemovedNode(chain.ChainId, chain.node.GraphTimestamp)
+	threshold := uint64(config.KernelNodeAcceptPeriodMaximum)
+	if rn != nil && rn.Timestamp+threshold < chain.node.GraphTimestamp {
+		// FIXME the timestamp check is because we can't ensure the last
+		// round of a removed node yet thus will cause inconsistency when
+		// calculate mint works
+		return
+	}
+
+	if internal.MockRunAggregators() {
+		return
+	}
+
+	chain.running.Store(true)
+	chain.loopsStarted = true
+	go chain.AggregateMintWork()
+	go chain.AggregateRoundSpace()
+	go chain.QueuePollSnapshots()
+	go chain.ConsumeFinalActions()
+}
+
+func (chain *Chain) waitOrDone(wait time.Duration) {
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+
+	select {
+	case <-chain.node.done:
+		chain.running.Store(false)
+	case <-timer.C:
+	}
+}
+
+// wakeCosiLoop signals QueuePollSnapshots that new CoSi work is available.
+// The channel has capacity one, so repeated signals coalesce into a single
+// immediate iteration instead of queueing up.
+func (chain *Chain) wakeCosiLoop() {
+	select {
+	case chain.cosiWake <- struct{}{}:
+	default:
+	}
+}
+
+func (chain *Chain) waitCosiLoop(wait time.Duration) {
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+
+	select {
+	case <-chain.node.done:
+		chain.running.Store(false)
+	case <-chain.cosiWake:
+	case <-timer.C:
+	}
+}
+
+// requeueCosiAction returns an action to the pool without waking the poll
+// loop. It is used when the action cannot complete yet, e.g. its referenced
+// external round has not arrived: the periodic tick or the round-start
+// signal retries it, preserving the previous poll cadence instead of
+// spinning on a full validation pass per retry.
+func (chain *Chain) requeueCosiAction(m *CosiAction) {
+	if err := chain.CachePool.Offer(m); err != nil {
+		logger.Verbosef("requeueCosiAction(%s) %v FULL\n", chain.ChainId, m)
+	}
+}
+
+func (ab ActionBuffer) Offer(m *CosiAction) error {
+	select {
+	case ab <- m:
+		return nil
+	default:
+		return fmt.Errorf("full")
+	}
+}
+
+func (ab ActionBuffer) Poll() *CosiAction {
+	select {
+	case m := <-ab:
+		return m
+	default:
+		return nil
+	}
+}
+
+func (chain *Chain) loadIdentity() *CNode {
+	now := clock.NowUnixNano()
+	for _, n := range chain.node.NodesListWithoutState(now, false) {
+		if chain.ChainId == n.IdForNetwork {
+			return n
+		}
+	}
+	if chain.node.IdForNetwork == chain.ChainId {
+		return &CNode{
+			IdForNetwork: chain.ChainId,
+			Signer:       chain.node.Signer,
+		}
+	}
+	return nil
+}
+
+func (chain *Chain) Teardown() {
+	chain.Lock()
+	chain.tornDown = true
+	chain.running.Store(false)
+	started := chain.loopsStarted
+	chain.Unlock()
+	if !started {
+		return
+	}
+	<-chain.clc
+	<-chain.plc
+	<-chain.wlc
+	<-chain.slc
+}
+
+func (chain *Chain) IsPledging() bool {
+	return chain.State == nil && chain.ConsensusInfo != nil
+}
+
+func (chain *Chain) StateCopy() (*CacheRound, *FinalRound) {
+	return chain.State.CacheRound.Copy(), chain.State.FinalRound.Copy()
+}
+
+func (chain *Chain) loadState() error {
+	chain.Lock()
+	defer chain.Unlock()
+
+	if chain.State != nil {
+		return nil
+	}
+
+	chain.ConsensusInfo = chain.loadIdentity()
+	state := &ChainState{RoundLinks: make(map[crypto.Hash]uint64)}
+
+	cache, err := loadHeadRoundForNode(chain.persistStore, chain.ChainId)
+	if err != nil || cache == nil {
+		return err
+	}
+	state.CacheRound = cache
+
+	final, err := loadFinalRoundForNode(chain.persistStore, chain.ChainId, cache.Number-1)
+	if err != nil {
+		return err
+	}
+	state.FinalRound = final
+	state.RoundHistory = loadRoundHistoryForNode(chain.persistStore, final)
+	cache.Timestamp = final.Start + config.SnapshotRoundGap
+
+	allNodes := chain.node.NodesListWithoutState(clock.NowUnixNano(), false)
+	for _, cn := range allNodes {
+		if chain.ChainId == cn.IdForNetwork {
+			continue
+		}
+		link, err := chain.persistStore.ReadLink(chain.ChainId, cn.IdForNetwork)
+		if err != nil {
+			return err
+		}
+		state.RoundLinks[cn.IdForNetwork] = link
+	}
+
+	chain.publishGraphSnapshot(final)
+	chain.State = state
+	return nil
+}
+
+func (chain *Chain) QueuePollSnapshots() {
+	logger.Printf("QueuePollSnapshots(%s)\n", chain.ChainId)
+	defer close(chain.plc)
+
+	for chain.running.Load() {
+		var cache int
+		// A newly appended final snapshot is processed immediately, while
+		// retries of snapshots still waiting for their transactions keep
+		// the previous 100ms poll cadence.
+		checkFinals := chain.finalPoolDirty.Load() || clock.Now().Sub(chain.lastFinalCheck) >= 100*time.Millisecond
+		if checkFinals {
+			chain.finalPoolDirty.Store(false)
+			chain.lastFinalCheck = clock.Now()
+		}
+		for i := range 2 {
+			if !checkFinals {
+				break
+			}
+			index := (chain.FinalIndex + i) % FinalPoolSlotsLimit
+			round := chain.FinalPool[index]
+			if round == nil {
+				logger.Debugf("QueuePollSnapshots final round empty %s %d %d\n", chain.ChainId, chain.FinalIndex, index)
+				continue
+			}
+			if cs := chain.State; cs != nil && (round.Number < cs.CacheRound.Number || round.Number > cs.CacheRound.Number+1) {
+				logger.Debugf("QueuePollSnapshots final round number bad %s %d %d %d\n",
+					chain.ChainId, chain.FinalIndex, cs.CacheRound.Number, round.Number)
+				continue
+			}
+			logger.Debugf("QueuePollSnapshots final round good %s %d %d %d\n",
+				chain.ChainId, chain.FinalIndex, round.Number, round.Size)
+			for j := range round.Size {
+				ps := round.Snapshots[j]
+				logger.Debugf("QueuePollSnapshots final snapshot %s %d %s %t %d\n",
+					chain.ChainId, chain.FinalIndex, ps.Snapshot.Hash, ps.finalized, len(ps.peers))
+				if ps.finalized {
+					continue
+				}
+				for _, pid := range ps.peers {
+					finalized, err := chain.cosiHook(&CosiAction{
+						PeerId:   pid,
+						Action:   CosiActionFinalization,
+						Snapshot: ps.Snapshot,
+					})
+					if err != nil {
+						panic(err)
+					}
+					ps.finalized = finalized
+					if ps.finalized {
+						break
+					}
+				}
+				if i != 0 {
+					break
+				}
+			}
+			logger.Debugf("QueuePollSnapshots final round done %s %d %d %d\n",
+				chain.ChainId, chain.FinalIndex, round.Number, round.Size)
+		}
+
+		logger.Debugf("QueuePollSnapshots cache pool begin %s when final %d %d\n",
+			chain.ChainId, chain.FinalIndex, chain.FinalCount)
+		for {
+			logger.Debugf("QueuePollSnapshots cache pool step %s from %d when final %d %d\n",
+				chain.ChainId, cache, chain.FinalIndex, chain.FinalCount)
+			m := chain.CachePool.Poll()
+			if m == nil {
+				logger.Verbosef("QueuePollSnapshots(%s) break at %d when final %d %d\n",
+					chain.ChainId, cache, chain.FinalIndex, chain.FinalCount)
+				break
+			}
+			logger.Debugf("QueuePollSnapshots cache pool step %s got %v when final %d %d\n",
+				chain.ChainId, m, chain.FinalIndex, chain.FinalCount)
+			_, err := chain.cosiHook(m)
+			if err != nil {
+				panic(err)
+			}
+			cache++
+			logger.Debugf("QueuePollSnapshots cache pool step %s to %d when final %d %d\n",
+				chain.ChainId, cache, chain.FinalIndex, chain.FinalCount)
+			if cache > 256 {
+				logger.Verbosef("QueuePollSnapshots(%s) break at %d when final %d %d\n",
+					chain.ChainId, cache, chain.FinalIndex, chain.FinalCount)
+				break
+			}
+		}
+		logger.Debugf("QueuePollSnapshots cache pool end %s when final %d %d\n",
+			chain.ChainId, chain.FinalIndex, chain.FinalCount)
+		chain.expireCosiAggregators(clock.NowUnixNano())
+
+		chain.waitCosiLoop(100 * time.Millisecond)
+	}
+}
+
+func (chain *Chain) StepForward() {
+	logger.Debugf("graph chain StepForward(%d, %d)\n", chain.FinalIndex, chain.FinalCount)
+	chain.FinalIndex = (chain.FinalIndex + 1) % FinalPoolSlotsLimit
+	chain.FinalCount = chain.FinalCount + 1
+}
+
+func (chain *Chain) ConsumeFinalActions() {
+	logger.Printf("ConsumeFinalActions(%s)\n", chain.ChainId)
+	defer close(chain.clc)
+
+	for chain.running.Load() {
+		var ps *CosiAction
+		select {
+		case <-chain.node.done:
+			chain.running.Store(false)
+			return
+		case ps = <-chain.finalActionsRing:
+		}
+		if ps == nil {
+			continue
+		}
+		logger.Debugf("ConsumeFinalActions(%s) %s\n", chain.ChainId, ps.Snapshot.Hash)
+		for chain.running.Load() {
+			retry, err := chain.appendFinalSnapshot(ps.PeerId, ps.Snapshot)
+			if err != nil {
+				panic(err)
+			} else if retry {
+				chain.waitOrDone(time.Second)
+			} else {
+				break
+			}
+		}
+	}
+}
+
+func (chain *Chain) appendFinalSnapshot(peerId crypto.Hash, s *common.Snapshot) (bool, error) {
+	logger.Debugf("appendFinalSnapshot(%s, %s)\n", peerId, s.Hash)
+	start, fi := uint64(0), chain.FinalIndex
+	if chain.State != nil {
+		start = chain.State.CacheRound.Number
+		pr := chain.FinalPool[fi]
+		if pr == nil || pr.Number == start || pr.Number+FinalPoolSlotsLimit == start {
+			logger.Debugf("appendFinalSnapshot(%s, %s) cache and index match %d\n", peerId, s.Hash, start)
+		} else {
+			logger.Verbosef("appendFinalSnapshot(%s, %s) cache and index malformed %d %d\n", peerId, s.Hash, start, pr.Number)
+			return true, nil
+		}
+	}
+	if s.RoundNumber < start {
+		logger.Debugf("appendFinalSnapshot(%s, %s) expired on start %d %d\n", peerId, s.Hash, s.RoundNumber, start)
+		return false, nil
+	}
+	delta := s.RoundNumber - start
+	if delta >= FinalPoolSlotsLimit {
+		logger.Verbosef("appendFinalSnapshot(%s, %s) pool slots full %d %d %d %d\n",
+			peerId, s.Hash, start, s.RoundNumber, chain.FinalIndex, fi)
+		return false, nil
+	}
+	offset := (int(delta) + fi) % FinalPoolSlotsLimit
+	round := chain.FinalPool[offset]
+	if round == nil {
+		round = &ChainRound{
+			Number:    s.RoundNumber,
+			Timestamp: s.Timestamp,
+			index:     make(map[crypto.Hash]int),
+			Size:      0,
+		}
+	} else if round.Number != s.RoundNumber {
+		round.Number = s.RoundNumber
+		round.Timestamp = s.Timestamp
+		round.index = make(map[crypto.Hash]int)
+		round.Size = 0
+	}
+	index, found := round.index[s.Hash]
+	changed := false
+	if !found {
+		if round.Size == FinalPoolRoundSizeLimit {
+			return false, fmt.Errorf("appendFinalSnapshot(%s, %s) round snapshots full %s:%d",
+				peerId, s.Hash, s.NodeId, s.RoundNumber)
+		}
+		round.Snapshots[round.Size] = &PeerSnapshot{
+			Snapshot: s,
+			peers:    []crypto.Hash{peerId},
+			filter:   map[crypto.Hash]bool{peerId: true},
+		}
+		round.index[s.Hash] = round.Size
+		round.Size = round.Size + 1
+		changed = true
+	} else {
+		ps := round.Snapshots[index]
+		if len(ps.filter) < 3 && !ps.filter[peerId] {
+			ps.filter[peerId] = true
+			ps.peers = append(ps.peers, peerId)
+			changed = true
+		}
+	}
+	chain.FinalPool[offset] = round
+	if changed {
+		chain.finalPoolDirty.Store(true)
+		chain.wakeCosiLoop()
+	}
+	return false, nil
+}
+
+func (chain *Chain) AppendFinalSnapshot(peerId crypto.Hash, s *common.Snapshot) error {
+	logger.Debugf("AppendFinalSnapshot(%s, %s)\n", peerId, s.Hash)
+	if s.NodeId != chain.ChainId {
+		panic("final queue malformed")
+	}
+	if cs := chain.State; cs != nil && cs.CacheRound.Number > s.RoundNumber {
+		return nil
+	}
+	ps := &CosiAction{PeerId: peerId, Snapshot: s}
+	err := chain.finalActionsRing.Offer(ps)
+	if err != nil {
+		return fmt.Errorf("AppendFinalSnapshot(%s, %s) final actions ring full %d %d",
+			peerId, s.Hash, s.RoundNumber, chain.FinalIndex)
+	}
+	return nil
+}
+
+func (chain *Chain) AppendCosiAction(m *CosiAction) error {
+	logger.Debugf("AppendCosiAction(%s) %v\n", chain.ChainId, m)
+	switch m.Action {
+	case CosiActionSelfEmpty:
+		if m.PeerId != chain.ChainId {
+			panic("should never be here")
+		}
+		if chain.ChainId != chain.node.IdForNetwork {
+			panic("should never be here")
+		}
+	case CosiActionSelfCommitment, CosiActionSelfResponse, CosiActionExternalCommitments, CosiActionSelfFullCommitment:
+		if m.PeerId == chain.ChainId {
+			panic("should never be here")
+		}
+		if chain.ChainId != chain.node.IdForNetwork {
+			panic("should never be here")
+		}
+	case CosiActionExternalAnnouncement, CosiActionExternalChallenge, CosiActionExternalFullChallenge:
+		if m.PeerId != chain.ChainId {
+			panic("should never be here")
+		}
+		if chain.ChainId == chain.node.IdForNetwork {
+			panic("should never be here")
+		}
+	default:
+		panic("should never be here")
+	}
+
+	err := chain.CachePool.Offer(m)
+	if err == nil {
+		chain.wakeCosiLoop()
+		return nil
+	}
+	if m.Action == CosiActionSelfEmpty {
+		chain.node.requeueTransactions(m.Snapshot.Transactions)
+	}
+	logger.Verbosef("AppendCosiAction(%s) %v FULL\n", chain.ChainId, m)
+	return nil
+}
+
+func (chain *Chain) AppendSelfEmpty(s *common.Snapshot) error {
+	if len(s.Transactions) == 0 {
+		panic(s.NodeId)
+	}
+	return chain.AppendCosiAction(&CosiAction{
+		PeerId:   chain.node.IdForNetwork,
+		Action:   CosiActionSelfEmpty,
+		Snapshot: s,
+	})
+}
+
+func (node *Node) BootChain(id crypto.Hash) *Chain {
+	chain := node.getOrCreateChain(id)
+	chain.bootLoops()
+	return chain
+}
+
+func (node *Node) getOrCreateChain(id crypto.Hash) *Chain {
+	chain := node.getChain(id)
+	if chain != nil {
+		return chain
+	}
+	if id != node.IdForNetwork && !slices.ContainsFunc(node.allNodesSortedWithState, func(cn *CNode) bool {
+		return cn.IdForNetwork == id
+	}) { // TODO slash malicious node
+		return nil
+	}
+
+	node.chains.Lock()
+	defer node.chains.Unlock()
+
+	chain = node.chains.m[id]
+	if chain != nil {
+		return chain
+	}
+	node.chains.m[id] = node.buildChain(id)
+	return node.chains.m[id]
+}
+
+func (node *Node) getChain(id crypto.Hash) *Chain {
+	node.chains.RLock()
+	defer node.chains.RUnlock()
+
+	return node.chains.m[id]
+}
+
+type chainsMap struct {
+	sync.RWMutex
+	m map[crypto.Hash]*Chain
+}

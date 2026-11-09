@@ -1,0 +1,41 @@
+name: Mixin Test
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  run:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: ['ubuntu-latest', 'macos-latest']
+      fail-fast: false
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: 1.27
+
+      - name: Build Mixin
+        run: |
+          CGO_ENABLED=0 go build -o mixin .
+
+      - name: Basic Testing
+        if: ${{ matrix.os == 'ubuntu-latest' }}
+        working-directory: .
+        run: |
+          CGO_ENABLED=0 go test -skip TestConsensus -v ./...
+
+      - name: Consensus Testing
+        if: ${{ matrix.os == 'ubuntu-latest' }}
+        working-directory: .
+        run: |
+          CGO_ENABLED=0 MIXIN_TX_SNAPSHOT_TRACE=1 ELECTION=true METRICS=true INPUT=1000 go test -timeout=7m -v ./rpc

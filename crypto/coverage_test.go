@@ -1,0 +1,427 @@
+package crypto
+
+import (
+	"bytes"
+	"errors"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+)
+
+func TestHashHelpers(t *testing.T) {
+	require := require.New(t)
+
+	var zero Hash
+	require.False(zero.HasValue())
+
+	msg := Blake3Hash([]byte("hash helpers"))
+	net := Blake3Hash([]byte("testnet"))
+	require.True(msg.HasValue())
+	require.Equal(Blake3Hash(append(net[:], msg[:]...)), msg.ForNetwork(net))
+	require.NotEqual(msg.ForNetwork(net), msg.ForNetwork(Blake3Hash([]byte("mainnet"))))
+}
+
+func TestKeyHelpersAndAggregateVerify(t *testing.T) {
+	require := require.New(t)
+
+	key := NewKeyFromSeed(testSeed(1))
+	parsed, err := KeyFromString(key.String())
+	require.Nil(err)
+	require.Equal(key, parsed)
+
+	_, err = KeyFromString(key.String()[:len(key.String())-2])
+	require.ErrorContains(err, "invalid key size")
+
+	var zero Key
+	require.False(zero.HasValue())
+	require.True(key.HasValue())
+
+	derived := key.DeterministicHashDerive()
+	require.True(derived.HasValue())
+	require.Equal(derived, key.DeterministicHashDerive())
+	require.NotEqual(key, derived)
+
+	a := NewKeyFromSeed(testSeed(2))
+	A := a.Public()
+	b := NewKeyFromSeed(testSeed(3))
+	B := b.Public()
+	r := NewKeyFromSeed(testSeed(4))
+	require.Equal(*DeriveGhostPublicKey(&r, &A, &B, 7), *DeriveGhostPublicKeyForInternalVanish(&r, &A, &B, 7))
+
+	k1 := NewKeyFromSeed(testSeed(10))
+	k2 := NewKeyFromSeed(testSeed(11))
+	k3 := NewKeyFromSeed(testSeed(12))
+	p1 := k1.Public()
+	p2 := k2.Public()
+	p3 := k3.Public()
+	publics := []*Key{&p1, &p2, &p3}
+	signers := []int{0, 2}
+	msg := Blake3Hash([]byte("aggregate verify"))
+
+	sig, err := AggregateSign([]*Key{&k1, &k3}, publics, signers, testSeed(13), msg)
+	require.Nil(err)
+	err = AggregateVerify(sig, publics, signers, msg)
+	require.Nil(err)
+
+	err = AggregateVerify(sig, publics, []int{3}, msg)
+	require.ErrorContains(err, "invalid aggregation signer index")
+
+	sig[0] ^= 0xff
+	err = AggregateVerify(sig, publics, signers, msg)
+	require.ErrorContains(err, "signature verify failed")
+}
+
+func TestSignaturePartsAndCosiJSON(t *testing.T) {
+	require := require.New(t)
+
+	key := NewKeyFromSeed(testSeed(21))
+	msg := Blake3Hash([]byte("signature parts"))
+	sig := key.Sign(msg)
+	require.Equal(sig[:32], sig.R())
+	require.Equal(sig[32:], sig.S())
+
+	cosi := CosiSignature{Signature: sig, Mask: 0x123}
+	data, err := cosi.MarshalJSON()
+	require.Nil(err)
+
+	var decoded CosiSignature
+	err = decoded.UnmarshalJSON(data)
+	require.Nil(err)
+	require.Equal(cosi.Signature, decoded.Signature)
+	require.Equal(cosi.Mask, decoded.Mask)
+
+	err = decoded.UnmarshalJSON([]byte(`"abcd"`))
+	require.ErrorContains(err, "invalid signature length")
+}
+
+func TestCosiCommitAndAggregateErrors(t *testing.T) {
+	require := require.New(t)
+
+	require.Panics(func() {
+		cosiCommit(bytes.NewReader(make([]byte, 63)))
+	})
+
+	require.Panics(func() {
+		cosiCommit(errReader{})
+	})
+
+	message := Blake3Hash([]byte("cosi aggregate errors"))
+	good := NewKeyFromSeed(testSeed(30)).Public()
+	publics := []*Key{&good}
+
+	badPair := &CosiCommitment{rPub1: Key{1}, rPub2: good}
+	_, err := CosiAggregateCommitment(map[int]*CosiCommitment{0: badPair}, publics, message)
+	require.NotNil(err)
+
+	goodPair := &CosiCommitment{rPub1: good, rPub2: good}
+	_, err = CosiAggregateCommitment(map[int]*CosiCommitment{64: goodPair}, publics, message)
+	require.ErrorContains(err, "invalid cosi signature mask index 64")
+}
+
+func TestCosiNonceConstructorAndChallengeError(t *testing.T) {
+	require := require.New(t)
+
+	seed := testSeed(31)
+	nonce := CosiCommitNonce(bytes.NewReader(append(seed, seed...)))
+	expectedRandom := NewKeyFromSeed(seed)
+	require.Equal(&CosiCommitment{rPub1: expectedRandom.Public(), rPub2: expectedRandom.Public()}, nonce.Public())
+
+	private := NewKeyFromSeed(testSeed(32))
+	public := private.Public()
+	publics := []*Key{&public}
+	message := Blake3Hash([]byte("cosi nonce constructor"))
+
+	invalidMask := &CosiSignature{Mask: 2}
+	invalidMask.SetRandoms(nonce.Public())
+	response, err := nonce.Response(invalidMask, &private, publics, message)
+	require.Nil(response)
+	require.ErrorContains(err, "invalid aggregation signer index 1")
+
+	signature, err := CosiAggregateCommitment(map[int]*CosiCommitment{0: nonce.Public()}, publics, message)
+	require.Nil(err)
+	response, err = nonce.Response(signature, &private, publics, message)
+	require.Nil(err)
+	require.Nil(signature.VerifyResponse(publics, 0, response, message))
+
+	require.Panics(func() {
+		newCosiNonce(nil, nil)
+	})
+}
+
+func TestBatchVerifierRejectsMalformedEntries(t *testing.T) {
+	require := require.New(t)
+
+	message := Blake3Hash([]byte("batch verification errors"))
+	private := NewKeyFromSeed(testSeed(33))
+	public := private.Public()
+	signature := private.Sign(message)
+
+	require.True(BatchVerify(message, []*Key{&public}, []*Signature{&signature}))
+	require.False(BatchVerify(message, []*Key{&public}, nil))
+	require.False(BatchVerify(message, nil, nil))
+
+	verifier := NewBatchVerifier()
+	verifier.add(&public, message[:], []byte{1})
+	require.False(verifier.Verify())
+
+	badR := signature
+	for i := range 32 {
+		badR[i] = 0xff
+	}
+	verifier = NewBatchVerifier()
+	verifier.add(&public, message[:], badR[:])
+	require.False(verifier.Verify())
+
+	badPublic := Key{}
+	for i := range badPublic {
+		badPublic[i] = 0xff
+	}
+	verifier = NewBatchVerifier()
+	verifier.add(&badPublic, message[:], signature[:])
+	require.False(verifier.Verify())
+
+	badS := signature
+	for i := 32; i < len(badS); i++ {
+		badS[i] = 0xff
+	}
+	verifier = NewBatchVerifier()
+	verifier.add(&public, message[:], badS[:])
+	require.False(verifier.Verify())
+}
+
+func TestAggregateAndCosiErrorBranches(t *testing.T) {
+	require := require.New(t)
+
+	message := Blake3Hash([]byte("aggregate error branches"))
+	private := NewKeyFromSeed(testSeed(34))
+	public := private.Public()
+	bad := Key{}
+	for i := range bad {
+		bad[i] = 0xff
+	}
+
+	_, err := AggregateSign([]*Key{&private}, []*Key{&bad}, []int{0}, testSeed(35), message)
+	require.Error(err)
+	_, err = AggregateSign([]*Key{&bad}, []*Key{&public}, []int{0}, testSeed(35), message)
+	require.Error(err)
+
+	publics := make([]*Key, 0x10001)
+	publics[0x10000] = &public
+	_, err = AggregateSign([]*Key{&private}, publics, []int{0x10000}, testSeed(35), message)
+	require.ErrorContains(err, "invalid aggregation signer index 65536")
+
+	var aggregateSignature Signature
+	err = AggregateVerify(&aggregateSignature, []*Key{&bad}, []int{0}, message)
+	require.Error(err)
+
+	response := &[32]byte{}
+	invalidMask := &CosiSignature{Mask: 2, commitments: map[int]*CosiCommitment{}}
+	err = invalidMask.AggregateResponse([]*Key{&public}, map[int]*[32]byte{1: response}, message, false)
+	require.ErrorContains(err, "mask index 1/1")
+	err = invalidMask.VerifyResponse([]*Key{&public}, 1, response, message)
+	require.ErrorContains(err, "mask index 1/1")
+	err = invalidMask.FullVerify([]*Key{&public}, 1, message)
+	require.ErrorContains(err, "aggregatePublicKey")
+
+	random := NewKeyFromSeed(testSeed(36))
+	commitment := &CosiCommitment{rPub1: random.Public(), rPub2: random.Public()}
+	cosi, err := CosiAggregateCommitment(map[int]*CosiCommitment{0: commitment}, []*Key{&public}, message)
+	require.NoError(err)
+	delete(cosi.commitments, 0)
+	err = cosi.AggregateResponse([]*Key{&public}, map[int]*[32]byte{0: response}, message, false)
+	require.ErrorContains(err, "invalid cosi signature response")
+
+	cosi, err = CosiAggregateCommitment(map[int]*CosiCommitment{0: commitment}, []*Key{&public}, message)
+	require.NoError(err)
+	invalidResponse := &[32]byte{}
+	for i := range invalidResponse {
+		invalidResponse[i] = 0xff
+	}
+	err = cosi.AggregateResponse([]*Key{&public}, map[int]*[32]byte{0: invalidResponse}, message, false)
+	require.Error(err)
+
+	require.Panics(func() {
+		_, _ = cosi.Response(&bad, &random, &random, []*Key{&public}, message)
+	})
+	require.Panics(func() {
+		_, _ = cosi.Response(&private, &bad, &random, []*Key{&public}, message)
+	})
+	require.Panics(func() {
+		_, _ = cosi.Response(&private, &random, &bad, []*Key{&public}, message)
+	})
+
+	validSignature := private.Sign(message)
+	validChallenge, err := cosi.Challenge([]*Key{&public}, message)
+	require.NoError(err)
+	validSignature[32] = 0xff
+	for i := 33; i < len(validSignature); i++ {
+		validSignature[i] = 0xff
+	}
+	require.False(public.VerifyWithChallenge(validSignature, validChallenge))
+}
+
+func TestSerializationLengthAndSyntaxErrors(t *testing.T) {
+	require := require.New(t)
+
+	_, err := HashFromString("zz")
+	require.Error(err)
+	_, err = KeyFromString("zz")
+	require.Error(err)
+
+	var hash Hash
+	err = hash.UnmarshalJSON([]byte(`"00"`))
+	require.ErrorContains(err, "invalid hash length")
+	var key Key
+	err = key.UnmarshalJSON([]byte(`"00"`))
+	require.ErrorContains(err, "invalid key length")
+	var signature Signature
+	err = signature.UnmarshalJSON([]byte(`"00"`))
+	require.ErrorContains(err, "invalid signature length")
+
+	var cosi CosiSignature
+	err = cosi.UnmarshalJSON([]byte("not-json"))
+	require.Error(err)
+	err = cosi.UnmarshalJSON([]byte(`"zz"`))
+	require.Error(err)
+}
+
+func TestCosiStrictAggregationAndVerificationErrors(t *testing.T) {
+	require := require.New(t)
+
+	keys, publics, randoms1, randoms2, cosi, message := buildCosiFixture(require)
+	resp0, err := cosi.Response(keys[0], randoms1[0], randoms2[0], publics, message)
+	require.Nil(err)
+	resp1, err := cosi.Response(keys[1], randoms1[1], randoms2[1], publics, message)
+	require.Nil(err)
+
+	err = cosi.AggregateResponse(publics, map[int]*[32]byte{0: resp0}, message, false)
+	require.ErrorContains(err, "missing key 1")
+
+	err = cosi.AggregateResponse(publics, map[int]*[32]byte{0: resp0, 1: resp1, 2: resp0}, message, false)
+	require.ErrorContains(err, "responses count 2/3")
+
+	badResp0, err := cosi.Response(keys[1], randoms1[0], randoms2[0], publics, message)
+	require.Nil(err)
+	err = cosi.VerifyResponse(publics, 0, badResp0, message)
+	require.ErrorContains(err, "invalid cosi signature response")
+
+	err = cosi.VerifyResponse(publics, 3, resp0, message)
+	require.ErrorContains(err, "invalid cosi signature mask index 3")
+
+	err = cosi.AggregateResponse(publics, map[int]*[32]byte{0: badResp0, 1: resp1}, message, true)
+	require.ErrorContains(err, "invalid cosi signature response")
+
+	_, _, _, _, cosi, _ = buildCosiFixture(require)
+	resp0, _ = cosi.Response(keys[0], randoms1[0], randoms2[0], publics, message)
+	resp1, _ = cosi.Response(keys[1], randoms1[1], randoms2[1], publics, message)
+	err = cosi.AggregateResponse(publics, map[int]*[32]byte{0: resp0, 1: resp1}, message, true)
+	require.Nil(err)
+
+	cosi.Signature[0] ^= 0xff
+	err = cosi.FullVerify(publics, 2, message)
+	require.ErrorContains(err, "signature verify failed")
+}
+
+func TestJSONErrorPathsAndKeyPanics(t *testing.T) {
+	require := require.New(t)
+
+	var hash Hash
+	err := hash.UnmarshalJSON([]byte("no-quotes"))
+	require.NotNil(err)
+	err = hash.UnmarshalJSON([]byte(`"zz"`))
+	require.NotNil(err)
+
+	var key Key
+	err = key.UnmarshalJSON([]byte("no-quotes"))
+	require.NotNil(err)
+	err = key.UnmarshalJSON([]byte(`"zz"`))
+	require.NotNil(err)
+
+	var sig Signature
+	err = sig.UnmarshalJSON([]byte("no-quotes"))
+	require.NotNil(err)
+	err = sig.UnmarshalJSON([]byte(`"zz"`))
+	require.NotNil(err)
+
+	require.Panics(func() {
+		NewKeyFromSeed(make([]byte, 63))
+	})
+
+	var invalid Key
+	for i := range invalid {
+		invalid[i] = 0xff
+	}
+
+	require.Panics(func() {
+		invalid.Public()
+	})
+
+	validPriv := NewKeyFromSeed(testSeed(50))
+	validPub := validPriv.Public()
+	require.Panics(func() {
+		KeyMultPubPriv(&invalid, &validPriv)
+	})
+	require.Panics(func() {
+		KeyMultPubPriv(&validPub, &invalid)
+	})
+	require.Panics(func() {
+		DeriveGhostPublicKey(&validPriv, &validPub, &invalid, 0)
+	})
+	require.Panics(func() {
+		DeriveGhostPrivateKey(&validPub, &validPriv, &invalid, 0)
+	})
+}
+
+func TestReadRandBranches(t *testing.T) {
+	require := require.New(t)
+
+	require.Panics(func() {
+		ReadRand(nil)
+	})
+
+	for size := 1; size <= 65; size++ {
+		buf := make([]byte, size)
+		require.NotPanics(func() { ReadRand(buf) }, "size=%d", size)
+		n, err := RandReader().Read(buf)
+		require.NoError(err)
+		require.Equal(size, n)
+	}
+}
+
+func testSeed(base byte) []byte {
+	seed := make([]byte, 64)
+	for i := range seed {
+		seed[i] = base + byte(i)
+	}
+	return seed
+}
+
+func buildCosiFixture(require *require.Assertions) ([]*Key, []*Key, []*Key, []*Key, *CosiSignature, Hash) {
+	priv0 := NewKeyFromSeed(testSeed(40))
+	priv1 := NewKeyFromSeed(testSeed(41))
+	pub0 := priv0.Public()
+	pub1 := priv1.Public()
+
+	rand0a := NewKeyFromSeed(testSeed(42))
+	rand0b := NewKeyFromSeed(testSeed(44))
+	rand1a := NewKeyFromSeed(testSeed(43))
+	rand1b := NewKeyFromSeed(testSeed(45))
+	commit0 := &CosiCommitment{rPub1: rand0a.Public(), rPub2: rand0b.Public()}
+	commit1 := &CosiCommitment{rPub1: rand1a.Public(), rPub2: rand1b.Public()}
+
+	message := Blake3Hash([]byte("cosi coverage"))
+	keys := []*Key{&priv0, &priv1}
+	publics := []*Key{&pub0, &pub1}
+	cosi, err := CosiAggregateCommitment(map[int]*CosiCommitment{0: commit0, 1: commit1}, publics, message)
+	require.Nil(err)
+
+	randoms1 := []*Key{&rand0a, &rand1a}
+	randoms2 := []*Key{&rand0b, &rand1b}
+	return keys, publics, randoms1, randoms2, cosi, message
+}
+
+type errReader struct{}
+
+func (errReader) Read(_ []byte) (int, error) {
+	return 0, errors.New("read failure")
+}

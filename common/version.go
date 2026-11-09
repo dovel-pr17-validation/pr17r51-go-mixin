@@ -1,0 +1,140 @@
+package common
+
+import (
+	"bytes"
+	"fmt"
+
+	"github.com/MixinNetwork/mixin/config"
+	"github.com/MixinNetwork/mixin/crypto"
+)
+
+type VersionedTransaction struct {
+	SignedTransaction
+
+	pmbytes []byte
+	hash    crypto.Hash
+}
+
+func (tx *SignedTransaction) AsVersioned() *VersionedTransaction {
+	if tx.Version < TxVersionHashSignature {
+		panic(tx.Version)
+	}
+	return &VersionedTransaction{
+		SignedTransaction: *tx,
+	}
+}
+
+func (tx *Transaction) AsVersioned() *VersionedTransaction {
+	if tx.Version < TxVersionHashSignature {
+		panic(tx.Version)
+	}
+	return &VersionedTransaction{
+		Transaction: *tx,
+	}
+}
+
+func UnmarshalVersionedTransaction(val []byte) (*VersionedTransaction, error) {
+	return unmarshalVersionedTransaction(val)
+}
+
+func (ver *VersionedTransaction) Marshal() []byte {
+	val := ver.marshal()
+	if config.Debug {
+		_, err := unmarshalVersionedTransaction(val)
+		if err != nil {
+			panic(err)
+		}
+	}
+	return val
+}
+
+func (ver *VersionedTransaction) PayloadMarshal() []byte {
+	if len(ver.pmbytes) > 0 {
+		return ver.pmbytes
+	}
+	val := ver.payloadMarshal()
+	if config.Debug {
+		_, err := unmarshalVersionedTransaction(val)
+		if err != nil {
+			panic(err)
+		}
+	}
+	ver.pmbytes = val
+	return ver.pmbytes
+}
+
+func (ver *VersionedTransaction) PayloadHash() crypto.Hash {
+	if !ver.hash.HasValue() {
+		ver.hash = crypto.Blake3Hash(ver.PayloadMarshal())
+	}
+	return ver.hash
+}
+
+func checkTxVersion(val []byte) uint8 {
+	if len(val) < 4 {
+		return 0
+	}
+	for _, i := range []byte{
+		TxVersionHashSignature,
+	} {
+		v := append(magic, 0, i)
+		if bytes.Equal(v, val[:4]) {
+			return i
+		}
+	}
+	return 0
+}
+
+func checkSnapVersion(val []byte) uint8 {
+	if len(val) < 4 {
+		return 0
+	}
+	for _, i := range []byte{
+		SnapshotVersionCommonEncoding,
+	} {
+		v := append(magic, 0, i)
+		if bytes.Equal(v, val[:4]) {
+			return i
+		}
+	}
+	return 0
+}
+
+func unmarshalVersionedTransaction(val []byte) (*VersionedTransaction, error) {
+	if len(val) > config.TransactionMaximumSize {
+		return nil, fmt.Errorf("transaction too large %d", len(val))
+	}
+
+	signed, err := NewDecoder(val).DecodeTransaction()
+	if err != nil {
+		return nil, err
+	}
+	ver := &VersionedTransaction{SignedTransaction: *signed}
+	if canonical := ver.marshalWithCapacity(len(val)); !bytes.Equal(canonical, val) {
+		return nil, fmt.Errorf("non-canonical transaction encoding")
+	}
+	return ver, nil
+}
+
+func (ver *VersionedTransaction) marshal() []byte {
+	return ver.marshalWithCapacity(0)
+}
+
+func (ver *VersionedTransaction) marshalWithCapacity(capacity int) []byte {
+	switch ver.Version {
+	case TxVersionHashSignature:
+		return newEncoder(capacity).EncodeTransaction(&ver.SignedTransaction)
+	default:
+		panic(ver.Version)
+	}
+}
+
+func (ver *VersionedTransaction) payloadMarshal() []byte {
+	switch ver.Version {
+	case TxVersionHashSignature:
+		signed := &SignedTransaction{Transaction: ver.Transaction}
+		return NewEncoder().EncodeTransaction(signed)
+	default:
+		panic(ver.Version)
+	}
+}

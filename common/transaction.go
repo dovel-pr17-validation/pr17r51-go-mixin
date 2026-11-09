@@ -1,0 +1,346 @@
+package common
+
+import (
+	"fmt"
+
+	"github.com/MixinNetwork/mixin/crypto"
+)
+
+const (
+	TxVersionHashSignature = 0x05
+
+	ExtraSizeGeneralLimit    = 256
+	InputIndexLimit          = 1024
+	ExtraSizeStorageStep     = 1024
+	ExtraSizeStorageCapacity = 1024 * 1024 * 4
+	ExtraStoragePriceStep    = "0.0001"
+	SliceCountLimit          = 256
+	ReferencesCountLimit     = 16
+
+	OutputTypeScript               = 0x00
+	OutputTypeWithdrawalSubmit     = 0xa1
+	OutputTypeNodePledge           = 0xa3
+	OutputTypeNodeAccept           = 0xa4
+	outputTypeNodeResign           = 0xa5
+	OutputTypeNodeRemove           = 0xa6
+	OutputTypeWithdrawalClaim      = 0xa9
+	outputTypeNodeCancel           = 0xaa
+	OutputTypeCustodianUpdateNodes = 0xb1
+	OutputTypeCustodianSlashNodes  = 0xb2
+
+	TransactionTypeScript               = 0x00
+	TransactionTypeMint                 = 0x01
+	TransactionTypeDeposit              = 0x02
+	TransactionTypeWithdrawalSubmit     = 0x03
+	TransactionTypeWithdrawalClaim      = 0x05
+	TransactionTypeNodePledge           = 0x06
+	TransactionTypeNodeAccept           = 0x07
+	transactionTypeNodeResign           = 0x08
+	TransactionTypeNodeRemove           = 0x09
+	transactionTypeNodeCancel           = 0x12
+	TransactionTypeCustodianUpdateNodes = 0x13
+	TransactionTypeCustodianSlashNodes  = 0x14
+	TransactionTypeUnknown              = 0xff
+)
+
+type Input struct {
+	Hash    crypto.Hash
+	Index   uint
+	Genesis []byte
+	Deposit *DepositData
+	Mint    *MintData
+}
+
+type Output struct {
+	Type   uint8
+	Amount Integer
+
+	Keys   []*crypto.Key
+	Mask   crypto.Key
+	Script Script
+
+	Withdrawal *WithdrawalData
+}
+
+type Transaction struct {
+	Version    uint8
+	Asset      crypto.Hash
+	Inputs     []*Input
+	Outputs    []*Output
+	References []crypto.Hash
+	Extra      []byte
+
+	validatedSize int
+}
+
+type SignedTransaction struct {
+	Transaction
+	AggregatedSignature *AggregatedSignature
+	SignaturesMap       []map[uint16]*crypto.Signature
+}
+
+func (tx *Transaction) ValidatedSize() int {
+	if tx.validatedSize == 0 {
+		panic(tx.AsVersioned().PayloadHash().String())
+	}
+	return tx.validatedSize
+}
+
+func (tx *Transaction) ViewGhostKey(a *crypto.Key) []*Output {
+	outputs := make([]*Output, 0)
+
+	for i, o := range tx.Outputs {
+		if o.Type != OutputTypeScript {
+			continue
+		}
+
+		out := &Output{
+			Type:   o.Type,
+			Amount: o.Amount,
+			Script: o.Script,
+			Mask:   o.Mask,
+		}
+		for _, k := range o.Keys {
+			key := crypto.ViewGhostOutputKey(k, a, &o.Mask, uint64(i))
+			out.Keys = append(out.Keys, key)
+		}
+		outputs = append(outputs, out)
+	}
+
+	return outputs
+}
+
+func (tx *SignedTransaction) IsSnapshotBatchable() bool {
+	switch tx.TransactionType() {
+	case TransactionTypeScript:
+	case TransactionTypeDeposit:
+	case TransactionTypeWithdrawalSubmit:
+	case TransactionTypeWithdrawalClaim:
+	default:
+		return false
+	}
+	return true
+}
+
+func (tx *SignedTransaction) TransactionType() uint8 {
+	for _, in := range tx.Inputs {
+		if in.Mint != nil {
+			return TransactionTypeMint
+		}
+		if in.Deposit != nil {
+			return TransactionTypeDeposit
+		}
+		if in.Genesis != nil {
+			return TransactionTypeUnknown
+		}
+	}
+
+	isScript := true
+	for _, out := range tx.Outputs {
+		switch out.Type {
+		case OutputTypeWithdrawalSubmit:
+			return TransactionTypeWithdrawalSubmit
+		case OutputTypeWithdrawalClaim:
+			return TransactionTypeWithdrawalClaim
+		case OutputTypeNodePledge:
+			return TransactionTypeNodePledge
+		case OutputTypeNodeAccept:
+			return TransactionTypeNodeAccept
+		case OutputTypeNodeRemove:
+			return TransactionTypeNodeRemove
+		case OutputTypeCustodianUpdateNodes:
+			return TransactionTypeCustodianUpdateNodes
+		case OutputTypeCustodianSlashNodes:
+			return TransactionTypeCustodianSlashNodes
+		}
+		isScript = isScript && out.Type == OutputTypeScript
+	}
+
+	if isScript {
+		return TransactionTypeScript
+	}
+	return TransactionTypeUnknown
+}
+
+func (signed *SignedTransaction) SignUTXO(utxo *UTXO, accounts []*Address) error {
+	if len(accounts) == 0 {
+		return nil
+	}
+	if utxo == nil {
+		return fmt.Errorf("nil input UTXO")
+	}
+	for index, in := range signed.Inputs {
+		if in.Hash == utxo.Hash && in.Index == utxo.Index {
+			return signed.signUTXO(index, &UTXOKeys{Mask: utxo.Mask, Keys: utxo.Keys}, accounts)
+		}
+	}
+	return fmt.Errorf("input not found %s:%d", utxo.Hash, utxo.Index)
+}
+
+func (signed *SignedTransaction) SignInput(reader UTXOKeysReader, index int, accounts []*Address) error {
+	if len(accounts) == 0 {
+		return nil
+	}
+	if index < 0 || index >= len(signed.Inputs) {
+		return fmt.Errorf("invalid input index %d/%d", index, len(signed.Inputs))
+	}
+	in := signed.Inputs[index]
+	if in.Deposit != nil || in.Mint != nil {
+		return signed.SignRaw(accounts[0].PrivateSpendKey)
+	}
+
+	utxo, err := reader.ReadUTXOKeys(in.Hash, in.Index)
+	if err != nil {
+		return err
+	}
+	if utxo == nil {
+		return fmt.Errorf("input not found %s:%d", in.Hash.String(), in.Index)
+	}
+	return signed.signUTXO(index, utxo, accounts)
+}
+
+func (signed *SignedTransaction) signUTXO(index int, utxo *UTXOKeys, accounts []*Address) error {
+	keysFilter := make(map[string]uint16)
+	for i, k := range utxo.Keys {
+		keysFilter[k.String()] = uint16(i)
+	}
+
+	sigs := make(map[uint16]*crypto.Signature)
+	msg := signed.AsVersioned().PayloadHash()
+	prevIndex := uint64(signed.Inputs[index].Index)
+	for _, acc := range accounts {
+		priv := crypto.DeriveGhostPrivateKey(&utxo.Mask, &acc.PrivateViewKey, &acc.PrivateSpendKey, prevIndex)
+		i, found := keysFilter[priv.Public().String()]
+		if !found {
+			return fmt.Errorf("invalid key for the input %s", acc.String())
+		}
+		sig := priv.Sign(msg)
+		sigs[i] = &sig
+	}
+	for len(signed.SignaturesMap) <= index {
+		signed.SignaturesMap = append(signed.SignaturesMap, nil)
+	}
+	signed.SignaturesMap[index] = sigs
+	return nil
+}
+
+func (signed *SignedTransaction) SignRaw(key crypto.Key) error {
+	msg := signed.AsVersioned().PayloadHash()
+
+	if len(signed.Inputs) != 1 {
+		return fmt.Errorf("invalid inputs count %d", len(signed.Inputs))
+	}
+	in := signed.Inputs[0]
+	if in.Deposit == nil && in.Mint == nil {
+		return fmt.Errorf("invalid input format")
+	}
+	sig := key.Sign(msg)
+	sigs := map[uint16]*crypto.Signature{0: &sig}
+	signed.SignaturesMap = []map[uint16]*crypto.Signature{sigs}
+	return nil
+}
+
+func (signed *SignedTransaction) AggregateSign(reader UTXOKeysReader, accounts [][]*Address, seed []byte) error {
+	if len(accounts) != len(signed.Inputs) {
+		return fmt.Errorf("invalid signing accounts count %d/%d", len(accounts), len(signed.Inputs))
+	}
+	var signers []int
+	var pubKeys, privKeys []*crypto.Key
+	for index, in := range signed.Inputs {
+		utxo, err := reader.ReadUTXOKeys(in.Hash, in.Index)
+		if err != nil {
+			return err
+		}
+		if utxo == nil {
+			return fmt.Errorf("input not found %s:%d", in.Hash.String(), in.Index)
+		}
+
+		keysFilter := make(map[string]int)
+		for i, k := range utxo.Keys {
+			keysFilter[k.String()] = i
+		}
+
+		for _, acc := range accounts[index] {
+			priv := crypto.DeriveGhostPrivateKey(&utxo.Mask, &acc.PrivateViewKey, &acc.PrivateSpendKey, uint64(in.Index))
+			i, found := keysFilter[priv.Public().String()]
+			if !found {
+				return fmt.Errorf("invalid key for the input %s", acc.String())
+			}
+			m := len(pubKeys) + i
+			if sl := len(signers); sl > 0 && m <= signers[sl-1] {
+				return fmt.Errorf("invalid signers order %d %d", signers[sl-1], m)
+			}
+			signers = append(signers, m)
+			privKeys = append(privKeys, priv)
+		}
+		pubKeys = append(pubKeys, utxo.Keys...)
+	}
+
+	msg := signed.AsVersioned().PayloadHash()
+	sig, err := crypto.AggregateSign(privKeys, pubKeys, signers, seed, msg)
+	if err != nil {
+		return err
+	}
+
+	as := &AggregatedSignature{Signers: signers}
+	copy(as.Signature[:], sig[:])
+	signed.AggregatedSignature = as
+	return nil
+}
+
+func NewTransactionV5(asset crypto.Hash) *Transaction {
+	return &Transaction{
+		Version: TxVersionHashSignature,
+		Asset:   asset,
+	}
+}
+
+func (tx *Transaction) AddInput(hash crypto.Hash, index uint) {
+	in := &Input{
+		Hash:  hash,
+		Index: index,
+	}
+	tx.Inputs = append(tx.Inputs, in)
+	if len(tx.Inputs) > SliceCountLimit {
+		panic(len(tx.Inputs))
+	}
+}
+
+func (tx *Transaction) AddOutputWithType(ot uint8, accounts []*Address, s Script, amount Integer, seed []byte) {
+	out := &Output{
+		Type:   ot,
+		Amount: amount,
+		Script: s,
+		Keys:   make([]*crypto.Key, 0),
+	}
+
+	if l := len(accounts); l > 0 {
+		internalVanish := l == 1 && s.String() == "fffe40"
+		r := crypto.NewKeyFromSeed(seed)
+		out.Mask = r.Public()
+		for _, a := range accounts {
+			var k *crypto.Key
+			if internalVanish {
+				k = crypto.DeriveGhostPublicKeyForInternalVanish(&r, &a.PublicViewKey, &a.PublicSpendKey, uint64(len(tx.Outputs)))
+			} else {
+				k = crypto.DeriveGhostPublicKey(&r, &a.PublicViewKey, &a.PublicSpendKey, uint64(len(tx.Outputs)))
+			}
+			out.Keys = append(out.Keys, k)
+		}
+	}
+
+	tx.Outputs = append(tx.Outputs, out)
+	if len(tx.Outputs) > SliceCountLimit {
+		panic(len(tx.Outputs))
+	}
+}
+
+func (tx *Transaction) AddScriptOutput(accounts []*Address, s Script, amount Integer, seed []byte) {
+	tx.AddOutputWithType(OutputTypeScript, accounts, s, amount, seed)
+}
+
+func (tx *Transaction) AddRandomScriptOutput(accounts []*Address, s Script, amount Integer) {
+	seed := make([]byte, 64)
+	crypto.ReadRand(seed)
+	tx.AddScriptOutput(accounts, s, amount, seed)
+}

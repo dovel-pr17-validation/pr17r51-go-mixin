@@ -1,0 +1,1850 @@
+package rpc
+
+import (
+	"bytes"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"os"
+	"slices"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/MixinNetwork/mixin/common"
+	"github.com/MixinNetwork/mixin/config"
+	"github.com/MixinNetwork/mixin/crypto"
+	"github.com/MixinNetwork/mixin/kernel"
+	"github.com/MixinNetwork/mixin/logger"
+	"github.com/MixinNetwork/mixin/storage"
+	"github.com/MixinNetwork/mixin/util"
+	"github.com/dgraph-io/ristretto/v2"
+	"github.com/stretchr/testify/require"
+)
+
+var (
+	NODES  = 8
+	INPUTS = 100
+)
+
+// txLatencyObserver tracks explicitly selected performance batches within one
+// testConsensus run. A hash is claimed by at most one polling goroutine, and
+// every goroutine is stopped and joined while its RPC servers are still alive.
+type txLatencyObserver struct {
+	tracked   sync.Map // crypto.Hash -> struct{}
+	sendTimes sync.Map // crypto.Hash -> time.Time immediately before the first RPC attempt
+	latencies sync.Map // crypto.Hash -> time.Duration until snapshot visibility on the selected node
+	observing sync.Map // crypto.Hash -> struct{}, deduplicates retry observers
+	maxSweep  atomic.Int64
+	stop      chan struct{}
+	wg        sync.WaitGroup
+}
+
+// txObserver is assigned once per testConsensus run by the main test
+// goroutine before any transaction is sent, and the previous run's
+// observers are always joined before the next run starts, so reads and
+// writes of this variable never race.
+var txObserver *txLatencyObserver
+
+func newTxLatencyObserver() *txLatencyObserver {
+	return &txLatencyObserver{stop: make(chan struct{})}
+}
+
+func (o *txLatencyObserver) close() {
+	close(o.stop)
+	o.wg.Wait()
+}
+
+const testStateSyncTimeout = time.Minute
+const txLatencyPollInterval = 200 * time.Millisecond
+
+func (o *txLatencyObserver) track(vers []*common.VersionedTransaction) {
+	o.maxSweep.Store(0)
+	for _, ver := range vers {
+		o.tracked.Store(ver.PayloadHash(), struct{}{})
+	}
+}
+
+func (o *txLatencyObserver) finish(vers []*common.VersionedTransaction) {
+	for _, ver := range vers {
+		hash := ver.PayloadHash()
+		o.tracked.Delete(hash)
+		o.sendTimes.Delete(hash)
+		o.latencies.Delete(hash)
+		o.observing.Delete(hash)
+	}
+}
+
+func (o *txLatencyObserver) markSend(hash crypto.Hash, at time.Time) {
+	if _, ok := o.tracked.Load(hash); ok {
+		o.sendTimes.LoadOrStore(hash, at)
+	}
+}
+
+func (o *txLatencyObserver) claim(hash crypto.Hash) bool {
+	if _, ok := o.tracked.Load(hash); !ok {
+		return false
+	}
+	if _, ok := o.latencies.Load(hash); ok {
+		return false
+	}
+	_, claimed := o.observing.LoadOrStore(hash, struct{}{})
+	return !claimed
+}
+
+func (o *txLatencyObserver) recordMaxSweep(d time.Duration) {
+	for current := o.maxSweep.Load(); d.Nanoseconds() > current; current = o.maxSweep.Load() {
+		if o.maxSweep.CompareAndSwap(current, d.Nanoseconds()) {
+			return
+		}
+	}
+}
+
+func TestConsensus(t *testing.T) {
+	testConsensus(t, true)
+	testConsensus(t, false)
+}
+
+func testConsensus(t *testing.T, externalRelayers bool) {
+	require := require.New(t)
+	kernel.TestMockReset()
+	txObserver = newTxLatencyObserver()
+	startAt := time.Now()
+
+	level, _ := strconv.ParseInt(os.Getenv("LOG"), 10, 64)
+	enableElection, err := strconv.ParseBool(os.Getenv("ELECTION"))
+	if err != nil {
+		enableElection = true
+	}
+	inputs, _ := strconv.ParseInt(os.Getenv("INPUT"), 10, 64)
+	logger.SetLevel(int(level))
+	if inputs > 0 {
+		INPUTS = int(inputs)
+	}
+	t.Logf("TEST WITH %d INPUTS AT %s FOR %s\n", INPUTS, time.Now(), time.Since(startAt))
+
+	root := t.TempDir()
+
+	accounts, payees, gdata, plist, relayerInstances, relayerServers := setupTestNet(root, externalRelayers)
+	require.Len(accounts, NODES)
+
+	epoch := time.Unix(1551312000, 0)
+	nodes := make([]*Node, 0)
+	instances := make([]*kernel.Node, 0)
+	for i := range accounts {
+		dir := fmt.Sprintf("%s/mixin-170%02d", root, i+1)
+		gns, err := common.ReadGenesis(dir + "/genesis.json")
+		require.Nil(err)
+		custom, err := config.Initialize(dir + "/config.toml")
+		require.Nil(err)
+		cache := newCache(custom)
+		store, err := storage.NewBadgerStore(custom, dir)
+		require.Nil(err)
+		require.NotNil(store)
+		if i == 0 {
+			kernel.TestMockDiff(time.Until(epoch))
+		}
+		node, err := kernel.SetupNode(custom, store, cache, gns)
+		require.Nil(err)
+		require.NotNil(node)
+		instances = append(instances, node)
+		host := fmt.Sprintf("127.0.0.1:180%02d", i+1)
+		nodes = append(nodes, &Node{Signer: node.Signer, Host: host})
+		t.Logf("NODES#%d %s %s\n", i, node.IdForNetwork, host)
+
+		server := NewServer(custom, store, node, 18000+i+1)
+		defer util.CloseOrPanic(server)
+		go func() { _ = server.ListenAndServe() }()
+		go func() { _ = node.Loop() }()
+	}
+	defer func() {
+		// Stop RPC polling before tearing down the servers it is using.
+		txObserver.close()
+		var wg sync.WaitGroup
+		for _, server := range relayerServers {
+			util.CloseOrPanic(server)
+		}
+		for _, n := range append(instances, relayerInstances...) {
+			wg.Go(n.Teardown)
+		}
+		wg.Wait()
+	}()
+	time.Sleep(3 * time.Second)
+
+	testRemovingNodePrediction(t, instances, true)
+
+	transactionsCount := NODES + 1
+	tl, sl := testVerifySnapshots(require, nodes, transactionsCount)
+	require.Equal(transactionsCount, len(tl))
+	require.Equal(transactionsCount, len(sl))
+	gt1 := testVerifyInfoAfter(require, nodes, epoch)
+	gts := epoch.Add(time.Duration(config.SnapshotRoundGap))
+	require.Truef(gt1.Timestamp.Before(gts), "%s should before %s", gt1.Timestamp, gts)
+
+	genesisAmount := (13439 + 3.5) / float64(INPUTS)
+	domainAddress := accounts[0].String()
+	deposits := make([]*common.VersionedTransaction, 0)
+	for i := range INPUTS {
+		raw := fmt.Sprintf(`{"version":5,"asset":"a99c2e0e2b1da4d648755ef19bd95139acbbe6564cfb06dec7cd34931ca72cdc","inputs":[{"deposit":{"chain":"8dd50817c082cdcdd6f167514928767a4b52426997bd6d4930eca101c5ff8a27","asset_key":"0xa974c709cfb4566686553a20790685a47aceaa33","transaction":"0xc7c1132b58e1f64c263957d7857fe5ec5294fce95d30dcd64efef71da1%06d","index":0,"amount":"%f"}}],"outputs":[{"type":0,"amount":"%f","script":"fffe01","accounts":["%s"]}]}`, i, genesisAmount, genesisAmount, domainAddress)
+		randT := int(time.Now().UnixNano()) % len(nodes)
+		tx, err := testSignTransaction(nodes[randT].Host, accounts[0], raw)
+		require.Nil(err)
+		require.NotNil(tx)
+		deposits = append(deposits, &common.VersionedTransaction{SignedTransaction: *tx})
+	}
+
+	txObserver.track(deposits)
+	kernel.ResetTxSnapshotLatency()
+	testSendTransactionsToNodesWithRetry(t, nodes, deposits[:INPUTS/2])
+	testSendTransactionsToNodesWithRetry(t, nodes, deposits[INPUTS/2:])
+	testLogTxToSnapshotLatency(t, "DEPOSIT", deposits)
+	transactionsCount = transactionsCount + INPUTS
+	tl, _ = testVerifySnapshots(require, nodes, transactionsCount)
+	require.Equal(transactionsCount, len(tl))
+	testVerifyDeposits(require, nodes, deposits)
+
+	gt2, drivers := testVerifyInfoAfterWithTraffic(t, require, nodes, accounts[0], gt1.Timestamp.Add(time.Duration(config.SnapshotRoundGap)))
+	transactionsCount = transactionsCount + drivers
+	gts = gt1.Timestamp.Add(time.Duration(config.SnapshotRoundGap))
+	require.Truef(gt2.Timestamp.After(gts), "%s should after %s", gt2.Timestamp, gts)
+	hr := testDumpGraphHead(nodes[0].Host, instances[0].IdForNetwork)
+	require.NotNil(hr)
+	require.GreaterOrEqual(hr.Round, uint64(0))
+	t.Logf("DEPOSIT TEST DONE AT %s FOR %s\n", time.Now(), time.Since(startAt))
+	testLogP2PMetrics(t, "DEPOSIT", instances)
+
+	testRemovingNodePrediction(t, instances, true)
+
+	utxos := make([]*common.VersionedTransaction, 0)
+	for _, d := range deposits {
+		raw := fmt.Sprintf(`{"version":5,"asset":"a99c2e0e2b1da4d648755ef19bd95139acbbe6564cfb06dec7cd34931ca72cdc","inputs":[{"hash":"%s","index":0}],"outputs":[{"type":0,"amount":"%f","script":"fffe01","accounts":["%s"]}]}`, d.PayloadHash().String(), genesisAmount, domainAddress)
+		randT := int(time.Now().UnixNano()) % len(nodes)
+		tx, err := testSignTransaction(nodes[randT].Host, accounts[0], raw)
+		require.Nil(err)
+		require.NotNil(tx)
+		if tx != nil {
+			utxos = append(utxos, &common.VersionedTransaction{SignedTransaction: *tx})
+		}
+	}
+	require.Equal(INPUTS, len(utxos))
+
+	txObserver.track(utxos)
+	kernel.ResetTxSnapshotLatency()
+	testSendTransactionsToNodesWithRetry(t, nodes, utxos[:INPUTS/2])
+	testSendTransactionsToNodesWithRetry(t, nodes, utxos[INPUTS/2:])
+	testLogTxToSnapshotLatency(t, "INPUT", utxos)
+	transactionsCount = transactionsCount + INPUTS
+	tl, _ = testVerifySnapshots(require, nodes, transactionsCount)
+	require.Equal(transactionsCount, len(tl))
+
+	gt3, drivers := testVerifyInfoAfterWithTraffic(t, require, nodes, accounts[0], gt2.Timestamp.Add(time.Duration(config.SnapshotRoundGap)))
+	transactionsCount = transactionsCount + drivers
+	gts = gt2.Timestamp.Add(time.Duration(config.SnapshotRoundGap))
+	require.Truef(gt3.Timestamp.After(gts), "%s should after %s", gt3.Timestamp, gts)
+	hr = testDumpGraphHead(nodes[0].Host, instances[0].IdForNetwork)
+	require.NotNil(hr)
+	require.Greater(hr.Round, uint64(0))
+	t.Logf("INPUT TEST DONE AT %s FOR %s\n", time.Now(), time.Since(startAt))
+	testLogP2PMetrics(t, "INPUT", instances)
+
+	custodian := testCustodianUpdateNodes(t, nodes, instances, accounts, payees, instances[0].NetworkId())
+	transactionsCount = transactionsCount + 2
+	t.Logf("CUSTODIAN TEST DONE AT %s FOR %s\n", time.Now(), time.Since(startAt))
+	testLogP2PMetrics(t, "CUSTODIAN", instances)
+
+	if !enableElection {
+		return
+	}
+
+	testRemovingNodePrediction(t, instances, true)
+	all := testListNodes(nodes[0].Host)
+	require.Len(all, NODES)
+	require.Equal("ACCEPTED", all[NODES-1].State)
+
+	input, pledgeTransactions, _ := testBuildPledgeInput(t, nodes, accounts[0], utxos)
+	time.Sleep(3 * time.Second)
+	transactionsCount = transactionsCount + pledgeTransactions
+	tl, _ = testVerifySnapshots(require, nodes, transactionsCount)
+	require.Equal(transactionsCount, len(tl))
+	gt4, drivers := testVerifyInfoAfterWithTraffic(t, require, nodes, custodian, gt3.Timestamp.Add(time.Second))
+	transactionsCount = transactionsCount + drivers
+	gts = gt3.Timestamp.Add(time.Second)
+	require.Truef(gt4.Timestamp.After(gts), "%s should after %s", gt4.Timestamp, gts)
+	t.Logf("PLEDGE INPUT READY %s\n", input)
+
+	dummyAmount := common.NewIntegerFromString("3.5").Div(NODES).String()
+	dummyInputs := make([]*common.Input, NODES)
+	for i := range dummyInputs {
+		hash, _ := crypto.HashFromString(input)
+		dummyInputs[i] = &common.Input{Hash: hash, Index: uint(i)}
+	}
+
+	legacy := time.Date(2023, time.Month(10), 31, 0, 0, 0, 0, time.UTC).Sub(epoch)
+	kernel.TestMockDiff(legacy)
+	for range 3 {
+		dummyInputs = testSendDummyTransactionsWithRetry(t, nodes, accounts[0], dummyInputs, dummyAmount)
+		transactionsCount = transactionsCount + len(dummyInputs)
+	}
+
+	mints := testListMintDistributions(nodes[0].Host)
+	require.Len(mints, 0)
+
+	logger.SetLevel(logger.ERROR)
+	err = logger.SetFilter("(?i)mint")
+	require.Nil(err)
+
+	kernel.TestMockDiff(time.Hour * (24 + config.KernelMintTimeBegin))
+	tl, _ = testVerifySnapshots(require, nodes, transactionsCount)
+	require.Equal(transactionsCount, len(tl))
+	gt5, drivers := testVerifyInfoAfterWithTraffic(t, require, nodes, custodian, gt4.Timestamp.Add(time.Duration(config.SnapshotRoundGap)))
+	transactionsCount = transactionsCount + drivers
+	gts = gt4.Timestamp.Add(time.Duration(config.SnapshotRoundGap))
+	require.Truef(gt5.Timestamp.After(gts), "%s should after %s", gt5.Timestamp, gts)
+
+	dummyInputs, mintTransactions := testSendDummyTransactionsUntilMint(t, nodes, accounts[0], dummyInputs, dummyAmount)
+	transactionsCount = transactionsCount + mintTransactions
+	testCheckMintDistributions(t, nodes[0].Host)
+	t.Logf("MINT TEST DONE AT %s FOR %s\n", time.Now(), time.Since(startAt))
+	testLogP2PMetrics(t, "MINT", instances)
+
+	kernel.TestMockDiff(time.Hour * 3) // pledge after mint
+	pn, pi, sv := testPledgeNewNode(t, nodes, accounts[0], gdata, plist, input, root)
+	t.Logf("PLEDGE NODE READY %s %s\n", pn.Signer, pi.IdForNetwork)
+	transactionsCount = transactionsCount + 1
+	defer pi.Teardown()
+	defer util.CloseOrPanic(sv)
+
+	for range 5 {
+		dummyInputs = testSendDummyTransactionsWithRetry(t, nodes, accounts[0], dummyInputs, dummyAmount)
+		transactionsCount = transactionsCount + len(dummyInputs)
+	}
+
+	transactionsCount = transactionsCount + 1
+	tl, _ = testVerifySnapshots(require, nodes, transactionsCount)
+	require.Equal(transactionsCount, len(tl))
+	gt6, drivers := testVerifyInfoAfterWithTraffic(t, require, nodes, custodian, gt5.Timestamp.Add(time.Duration(config.SnapshotRoundGap)))
+	transactionsCount = transactionsCount + drivers
+	gts = gt5.Timestamp.Add(time.Duration(config.SnapshotRoundGap))
+	require.Truef(gt6.Timestamp.After(gts), "%s should after %s", gt6.Timestamp, gts)
+	require.Equal("305850.45205696", gt6.PoolSize.String())
+	hr = testDumpGraphHead(nodes[0].Host, instances[0].IdForNetwork)
+	require.NotNil(hr)
+	require.Greater(hr.Round, uint64(0))
+	hr = testDumpGraphHead(nodes[0].Host, pi.IdForNetwork)
+	require.Nil(hr)
+
+	testRemovingNodePrediction(t, instances, true)
+
+	mints = testListMintDistributions(nodes[0].Host)
+	require.Len(mints, 1)
+
+	all = testListNodes(nodes[0].Host)
+	require.Len(all, NODES+1)
+	require.Equal(all[NODES].Signer.String(), pn.Signer.String())
+	require.Equal(all[NODES].Payee.String(), pn.Payee.String())
+	require.Equal("PLEDGING", all[NODES].State)
+	t.Logf("PLEDGE TEST DONE AT %s FOR %s\n", time.Now(), time.Since(startAt))
+	testLogP2PMetrics(t, "PLEDGE", instances)
+
+	// The pledge is created around hour 10. Stop at hour 12, immediately
+	// before the node-accept window opens at hour 13.
+	kernel.TestMockDiff(26 * time.Hour)
+	time.Sleep(3 * time.Second)
+	all = testListNodes(nodes[0].Host)
+	require.Len(all, NODES+1)
+	require.Equal(all[NODES].Signer.String(), pn.Signer.String())
+	require.Equal(all[NODES].Payee.String(), pn.Payee.String())
+	require.Equal("PLEDGING", all[NODES].State)
+	hr = testDumpGraphHead(nodes[0].Host, pi.IdForNetwork)
+	require.Nil(hr)
+
+	kernel.TestMockDiff(1 * time.Hour)
+	all = testListNodesUntilState(t, nodes[0].Host, pn.Signer, common.NodeStateAccepted, 5*time.Minute)
+	require.Len(all, NODES+1)
+	require.Equal(all[NODES].Signer.String(), pn.Signer.String())
+	require.Equal(all[NODES].Payee.String(), pn.Payee.String())
+	require.Equal("ACCEPTED", all[NODES].State)
+	acceptNodes := append(slices.Clone(nodes), &pn)
+	testVerifySnapshots(require, acceptNodes, transactionsCount+1)
+	hr = testDumpGraphHead(nodes[0].Host, instances[0].IdForNetwork)
+	require.NotNil(hr)
+	require.Greater(hr.Round, uint64(0))
+	hr = testDumpGraphHead(nodes[len(nodes)-1].Host, instances[0].IdForNetwork)
+	require.NotNil(hr)
+	require.Greater(hr.Round, uint64(0))
+	hr = testDumpGraphHead(nodes[0].Host, pi.IdForNetwork)
+	require.NotNil(hr)
+	require.Equal(uint64(0), hr.Round)
+	hr = testDumpGraphHead(nodes[len(nodes)-1].Host, pi.IdForNetwork)
+	require.NotNil(hr)
+	require.Equal(uint64(0), hr.Round)
+
+	testRemovingNodePrediction(t, instances, true)
+
+	transactionsCount = transactionsCount + 1
+	tl, _ = testVerifySnapshots(require, nodes, transactionsCount)
+	require.Equal(transactionsCount, len(tl))
+	gt7, drivers := testVerifyInfoAfterWithTraffic(t, require, nodes, custodian, gt6.Timestamp.Add(time.Duration(config.SnapshotRoundGap)))
+	transactionsCount = transactionsCount + drivers
+	gts = gt6.Timestamp.Add(time.Duration(config.SnapshotRoundGap))
+	require.Truef(gt7.Timestamp.After(gts), "%s should after %s", gt7.Timestamp, gts)
+	require.Equal("305850.45205696", gt7.PoolSize.String())
+	t.Logf("ACCEPT TEST DONE AT %s FOR %s\n", time.Now(), time.Since(startAt))
+	testLogP2PMetrics(t, "ACCEPT", instances)
+
+	kernel.TestMockDiff(24 * time.Hour)
+	time.Sleep(3 * time.Second)
+	tl, _ = testVerifySnapshots(require, nodes, transactionsCount)
+	require.Equal(transactionsCount, len(tl))
+	for i := range nodes {
+		all = testListNodes(nodes[i].Host)
+		require.Len(all, NODES+1)
+		require.Equal(all[NODES].Signer.String(), pn.Signer.String())
+		require.Equal(all[NODES].Payee.String(), pn.Payee.String())
+		require.Equal("ACCEPTED", all[NODES].State)
+	}
+
+	nodes = append(nodes, &Node{Host: "127.0.0.1:18099"})
+	signer, payee := testGetNodeToRemove(instances[0].NetworkId(), accounts, payees, 0)
+	require.Equal("XINW6HTiMVmKHjfnk3DYbcWcTaTkKi4dr3wZgicyhKvKnyYEqD8PD5ZRfL13ZsouiMURM6atDh3Bdr3dqSVkYWEm7Kzp9Axt", signer.String())
+	require.Equal("XINCtoRSJYrNNQUv3xTsptxDKRqwHMwtNkvsQwFS58oFXYvgu9QhoetNwbmxUQ4JJGcjR1gnttMau1nCmGpkSimHR1dxrP8u", payee.String())
+	nodes = testRemoveNode(nodes, signer)
+	for range 3 {
+		dummyInputs = testSendDummyTransactionsWithRetry(t, nodes, accounts[0], dummyInputs, dummyAmount)
+		transactionsCount = transactionsCount + len(dummyInputs)
+	}
+	transactionsCount = transactionsCount + 1
+
+	tl, _ = testVerifySnapshots(require, nodes, transactionsCount)
+	require.Equal(transactionsCount, len(tl))
+	for i := range nodes {
+		all = testListNodes(nodes[i].Host)
+		require.Len(all, NODES+1)
+		require.Equal(all[NODES].Signer.String(), signer.String())
+		require.Equal(all[NODES].Payee.String(), payee.String())
+		require.Equal("REMOVED", all[NODES].State)
+	}
+
+	hr = testDumpGraphHeadRoundAfter(nodes[0].Host, instances[0].IdForNetwork, 1)
+	require.NotNil(hr)
+	require.Greater(hr.Round, uint64(1))
+	hr = testDumpGraphHeadRoundAfter(nodes[len(nodes)-1].Host, instances[0].IdForNetwork, 1)
+	require.NotNil(hr)
+	require.Greater(hr.Round, uint64(1))
+	hr = testDumpGraphHeadRoundAfter(nodes[0].Host, pi.IdForNetwork, 0)
+	require.NotNil(hr)
+	require.GreaterOrEqual(hr.Round, uint64(0))
+	hr = testDumpGraphHeadRoundAfter(nodes[len(nodes)-1].Host, pi.IdForNetwork, 0)
+	require.NotNil(hr)
+	require.GreaterOrEqual(hr.Round, uint64(0))
+	hr = testDumpGraphHeadRoundAfter(nodes[0].Host, signer.Hash().ForNetwork(instances[0].NetworkId()), 1)
+	require.NotNil(hr)
+	require.Greater(hr.Round, uint64(1))
+	hr = testDumpGraphHeadRoundAfter(nodes[len(nodes)-1].Host, signer.Hash().ForNetwork(instances[0].NetworkId()), 1)
+	require.NotNil(hr)
+	require.Greater(hr.Round, uint64(1))
+
+	removalInputs := []*common.Input{{Hash: all[NODES].Transaction, Index: 0}}
+	removalInputs = testSendDummyTransactionsWithRetry(t, nodes[:1], payee, removalInputs, "13439")
+	require.Len(removalInputs, 1)
+	transactionsCount = transactionsCount + 1
+	tl, _ = testVerifySnapshots(require, nodes, transactionsCount)
+	require.Equal(transactionsCount, len(tl))
+	for i := range nodes {
+		all = testListNodes(nodes[i].Host)
+		require.Len(all, NODES+1)
+		require.Equal(all[NODES].Signer.String(), signer.String())
+		require.Equal(all[NODES].Payee.String(), payee.String())
+		require.Equal("REMOVED", all[NODES].State)
+	}
+	t.Logf("REMOVE TEST DONE AT %s FOR %s\n", time.Now(), time.Since(startAt))
+	testLogP2PMetrics(t, "REMOVE", instances)
+}
+
+func testLogP2PMetrics(t *testing.T, phase string, nodes []*kernel.Node) {
+	enableMetrics, _ := strconv.ParseBool(os.Getenv("METRICS"))
+	if !enableMetrics {
+		return
+	}
+	t.Helper()
+	for _, node := range nodes {
+		t.Logf("P2P METRICS AFTER %s TEST FOR %s %v", phase, node.IdForNetwork, node.Peer.Metric())
+		topology := node.TopologyStats()
+		t.Logf("KERNEL METRICS AFTER %s TEST FOR %s SPS:%f TPS:%f SPT:%f",
+			phase, node.IdForNetwork, topology.SPS, topology.TPS, topology.SPT)
+	}
+}
+
+func testRemovingNodePrediction(t *testing.T, instances []*kernel.Node, otherConsensus bool) {
+	require := require.New(t)
+
+	var id crypto.Hash
+	for _, n := range instances {
+		if !id.HasValue() || n.IdForNetwork.String() < id.String() {
+			id = n.IdForNetwork
+		}
+	}
+	for _, n := range instances {
+		r := n.GetRemovingOrSlashingNode(n.IdForNetwork)
+		if n.IdForNetwork == id && !otherConsensus {
+			require.NotNil(r)
+		} else {
+			require.Nil(r)
+		}
+	}
+}
+
+func testCustodianUpdateNodes(t *testing.T, nodes []*Node, instances []*kernel.Node, signers, payees []common.Address, networkId crypto.Hash) common.Address {
+	require := require.New(t)
+	tx := common.NewTransactionV5(common.XINAssetId)
+	require.NotNil(tx)
+
+	info := testGetGraphInfo(nodes[0].Host)
+	require.Equal("732075fd34914b7e14a589fb4109ee91e20de8d4e8863a861e8f64466a58eea2", info.Consensus.String())
+	cst := testGetSnapshotSoleTransaction(nodes[1].Host, info.Consensus.String())
+	require.Equal("1bdd5f4129b24279deaaecb18cf19ebf88e9c873a768b822471451dbcc24e1eb", cst.String())
+	domain := signers[0]
+	data, err := CallMixinRPC("http://"+nodes[0].Host, "listcustodianupdates", []any{})
+	require.NoError(err)
+	var previous []struct {
+		Transaction crypto.Hash `json:"transaction"`
+	}
+	require.NoError(json.Unmarshal(data, &previous))
+	require.NotEmpty(previous)
+
+	seed := make([]byte, 64)
+	crypto.ReadRand(seed)
+	count := len(signers)
+	custodian := common.NewAddressFromSeed(seed)
+
+	custodianNodes := make([]*common.CustodianNode, count)
+	for i := range count {
+		signer := signers[i]
+		payee := payees[i]
+		seed := make([]byte, 64)
+		crypto.ReadRand(seed)
+		custodian := common.NewAddressFromSeed(seed)
+		extra := common.EncodeCustodianNode(&custodian, &payee, &signer.PrivateSpendKey, &payee.PrivateSpendKey, &custodian.PrivateSpendKey, networkId)
+		custodianNodes[i] = &common.CustodianNode{Custodian: custodian, Payee: payee, Extra: extra}
+	}
+
+	amount := common.NewInteger(100).Mul(count)
+	tx.AddOutputWithType(common.OutputTypeCustodianUpdateNodes, []*common.Address{&custodian}, common.NewThresholdScript(common.Operator64), amount, bytes.Repeat([]byte{1}, 64))
+
+	sortedExtra := append(custodian.PublicSpendKey[:], custodian.PublicViewKey[:]...)
+	sort.Slice(custodianNodes, func(i, j int) bool {
+		return bytes.Compare(custodianNodes[i].Custodian.PublicSpendKey[:], custodianNodes[j].Custodian.PublicSpendKey[:]) < 0
+	})
+	for _, n := range custodianNodes {
+		sortedExtra = append(sortedExtra, n.Extra...)
+	}
+	sh := common.CustodianUpdateNodesApprovalHash(sortedExtra, previous[len(previous)-1].Transaction)
+	sig := domain.PrivateSpendKey.Sign(sh)
+	tx.Extra = append(sortedExtra, sig[:]...)
+	tx.References = []crypto.Hash{cst}
+
+	enode := electSnapshotNode(nodes, instances[0], common.TransactionTypeCustodianUpdateNodes, instances[0].GraphTimestamp)
+
+	raw := fmt.Sprintf(`{"version":5,"asset":"a99c2e0e2b1da4d648755ef19bd95139acbbe6564cfb06dec7cd34931ca72cdc","inputs":[{"deposit":{"chain":"8dd50817c082cdcdd6f167514928767a4b52426997bd6d4930eca101c5ff8a27","asset_key":"0xa974c709cfb4566686553a20790685a47aceaa33","transaction":"0xc7c1132b58e1f64c263957d7857fe5ec5294fce95d30dcd64efef71da1%06d","index":0,"amount":"%s"}}],"outputs":[{"type":0,"amount":"%s","script":"fffe01","accounts":["%s"]}]}`, 13439, amount.String(), amount.String(), domain.String())
+	deposit, err := testSignTransaction(enode.Host, domain, raw)
+	require.Nil(err)
+	require.NotNil(deposit)
+	deposits := []*common.VersionedTransaction{{SignedTransaction: *deposit}}
+	testSendTransactionsToNodesWithRetry(t, nodes, deposits)
+	testWaitTransactionsVisibleOnNodes(t, nodes, []crypto.Hash{deposit.AsVersioned().PayloadHash()})
+
+	inputs := []map[string]any{{
+		"hash":  deposit.AsVersioned().PayloadHash(),
+		"index": 0,
+	}}
+	out := tx.Outputs[0]
+	outputs := []map[string]any{{
+		"type":     out.Type,
+		"amount":   out.Amount,
+		"script":   out.Script.String(),
+		"accounts": []string{domain.String()},
+	}}
+	rb, _ := json.Marshal(map[string]any{
+		"version":    tx.Version,
+		"asset":      tx.Asset,
+		"inputs":     inputs,
+		"outputs":    outputs,
+		"extra":      hex.EncodeToString(tx.Extra),
+		"references": tx.References,
+	})
+	signed, err := testSignTransaction(enode.Host, domain, string(rb))
+	require.Nil(err)
+	require.NotNil(signed)
+
+	updates := []*common.VersionedTransaction{{SignedTransaction: *signed}}
+	testSendTransactionsToNodesWithRetry(t, nodes, updates)
+
+	raw = hex.EncodeToString(signed.AsVersioned().Marshal())
+	hash, err := testSendTransaction(enode.Host, raw)
+	require.Nil(err)
+	require.True(hash.HasValue())
+
+	data, err = CallMixinRPC("http://"+enode.Host, "listcustodianupdates", []any{})
+	require.Nil(err)
+	var curs []*struct {
+		Custodian   string `json:"custodian"`
+		Timestamp   uint64 `json:"timestamp"`
+		Transaction string `json:"transaction"`
+	}
+	err = json.Unmarshal(data, &curs)
+	require.Nil(err)
+	require.Len(curs, 2)
+	require.Equal(hash.String(), curs[1].Transaction)
+	require.Equal(custodian.String(), curs[1].Custodian)
+	return custodian
+}
+
+func testCheckMintDistributions(t *testing.T, node string) {
+	require := require.New(t)
+	mints := testWaitMintDistributions(t, node, 1)
+	require.Len(mints, 1)
+	tx := mints[0]
+	require.Len(tx.Inputs, 1)
+	mint := tx.Inputs[0].Mint
+	daily := common.NewIntegerFromString("89.87671232")
+	require.Equal("UNIVERSAL", mint.Group)
+	require.Equal(uint64(1707), mint.Batch)
+	require.Equal(daily, mint.Amount)
+	require.Len(tx.Outputs, NODES+2)
+	total := common.Zero
+	for i, o := range tx.Outputs {
+		if i < NODES {
+			total = total.Add(o.Amount)
+			require.Equal("fffe01", o.Script.String())
+			require.Equal(uint8(common.OutputTypeScript), o.Type)
+			require.Len(o.Keys, 1)
+		} else if i == NODES {
+			require.Equal("fffe01", o.Script.String())
+			require.Equal(daily.Div(10).Mul(4), o.Amount)
+			require.Equal(uint8(common.OutputTypeScript), o.Type)
+			require.Len(o.Keys, 1)
+		} else if i == NODES+1 {
+			custodian := daily.Div(10).Mul(4)
+			total = total.Add(custodian)
+			light := daily.Sub(total)
+			require.Equal("fffe40", o.Script.String())
+			require.Equal(light, o.Amount)
+			require.Equal(uint8(common.OutputTypeScript), o.Type)
+			require.Len(o.Keys, 1)
+		}
+	}
+}
+
+func testWaitMintDistributions(t *testing.T, node string, count int) []*common.VersionedTransaction {
+	require := require.New(t)
+	deadline := time.Now().Add(testStateSyncTimeout)
+	for {
+		mints := testListMintDistributions(node)
+		if len(mints) >= count {
+			return mints
+		}
+		if time.Now().After(deadline) {
+			require.Len(mints, count)
+		}
+		time.Sleep(time.Second)
+	}
+}
+
+func testSendDummyTransactionsUntilMint(t *testing.T, nodes []*Node, domain common.Address, inputs []*common.Input, amount string) ([]*common.Input, int) {
+	require := require.New(t)
+	deadline := time.Now().Add(5 * testStateSyncTimeout)
+	transactions := 0
+	for len(testListMintDistributions(nodes[0].Host)) == 0 {
+		if time.Now().After(deadline) {
+			require.FailNowf("timed out waiting for mint distribution", "sent %d extra dummy transactions", transactions)
+		}
+		t.Logf("MINT PENDING, SEND DUMMY ROUND AT %s\n", time.Now())
+		inputs = testSendDummyTransactionsWithRetry(t, nodes, domain, inputs, amount)
+		transactions = transactions + len(inputs)
+	}
+	return inputs, transactions
+}
+
+func testRemoveNode(nodes []*Node, r common.Address) []*Node {
+	var tmp []*Node
+	for _, n := range nodes {
+		if n.Signer.String() != r.String() {
+			tmp = append(tmp, n)
+		}
+	}
+	for n := len(tmp); n > 0; n-- {
+		randIndex := int(time.Now().UnixNano()) % n
+		tmp[n-1], tmp[randIndex] = tmp[randIndex], tmp[n-1]
+	}
+	return tmp
+}
+
+func testSendDummyTransactionsWithRetry(t *testing.T, nodes []*Node, domain common.Address, inputs []*common.Input, amount string) []*common.Input {
+	require := require.New(t)
+	deadline := time.Now().Add(testStateSyncTimeout)
+	outputs := make([]*common.Input, len(inputs))
+	pending := make([]int, len(inputs))
+	for i := range pending {
+		pending[i] = i
+	}
+
+	for attempt := 1; len(pending) > 0; attempt++ {
+		if time.Now().After(deadline) {
+			require.FailNowf("timed out waiting for dummy transactions",
+				"%d transactions still pending after %d attempts", len(pending), attempt-1)
+			return outputs
+		}
+
+		retryNodes := make([]*Node, len(pending))
+		retryInputs := make([]*common.Input, len(pending))
+		for i, index := range pending {
+			retryNodes[i] = nodes[index]
+			retryInputs[i] = inputs[index]
+		}
+		retries := testSendDummyTransactions(retryNodes, domain, retryInputs, amount)
+		require.Len(retries, len(pending))
+		for i, index := range pending {
+			outputs[index] = retries[i]
+		}
+
+		time.Sleep(3 * time.Second)
+		missing := make([]int, 0, len(pending))
+		for _, index := range pending {
+			in := outputs[index]
+			ver, snap, _ := GetTransaction("http://"+nodes[index].Host, in.Hash.String())
+			hash, _ := crypto.HashFromString(snap)
+			if hash.HasValue() {
+				continue
+			}
+			t.Logf("DUMMY UTXO %s:%d TRANSACTION %s PENDING IN %s AT %s (attempt %d)\n",
+				inputs[index].Hash, inputs[index].Index, in.Hash, nodes[index].Host, time.Now(), attempt)
+			if ver == nil {
+				t.Logf("DUMMY UTXO %s:%d TRANSACTION %s MISSING IN %s AT %s\n",
+					inputs[index].Hash, inputs[index].Index, in.Hash, nodes[index].Host, time.Now())
+			}
+			missing = append(missing, index)
+		}
+		pending = missing
+	}
+	return outputs
+}
+
+func testSendDummyTransactions(nodes []*Node, domain common.Address, inputs []*common.Input, amount string) []*common.Input {
+	outputs := make([]*common.Input, len(inputs))
+
+	var wg sync.WaitGroup
+	for i, node := range nodes {
+		wg.Go(func() {
+			raw, _ := json.Marshal(map[string]any{
+				"version": 2,
+				"asset":   "a99c2e0e2b1da4d648755ef19bd95139acbbe6564cfb06dec7cd34931ca72cdc",
+				"inputs": []map[string]any{{
+					"hash":  inputs[i].Hash.String(),
+					"index": inputs[i].Index,
+				}},
+				"outputs": []map[string]any{{
+					"type":     0,
+					"amount":   amount,
+					"script":   "fffe01",
+					"accounts": []string{domain.String()},
+				}},
+			})
+			tx, _ := testSignTransaction(node.Host, domain, string(raw))
+			ver := common.VersionedTransaction{SignedTransaction: *tx}
+			hash, _ := testSendTransaction(node.Host, hex.EncodeToString(ver.Marshal()))
+			outputs[i] = &common.Input{Index: 0, Hash: hash}
+		})
+	}
+	wg.Wait()
+
+	return outputs
+}
+
+const configDataTmpl = `[node]
+signer-key = "%s"
+consensus-only = false
+memory-cache-size = 128
+kernel-operation-period = 3
+cache-ttl = 3600
+[p2p]
+port = %d
+seeds = [%s]
+relayer = %t
+metric = true
+[rpc]
+port = %d
+`
+
+func testPledgeNewNode(t *testing.T, nodes []*Node, domain common.Address, genesisData []byte, plist, input, root string) (Node, *kernel.Node, *http.Server) {
+	require := require.New(t)
+	var signer, payee common.Address
+
+	signer = testDetermineAccountByIndex(NODES, "SIGNER")
+	payee = testDetermineAccountByIndex(NODES, "PAYEE")
+
+	dir := fmt.Sprintf("%s/mixin-17099", root)
+	err := os.MkdirAll(dir, 0755)
+	if err != nil {
+		panic(err)
+	}
+
+	configData := fmt.Appendf(nil, configDataTmpl, signer.PrivateSpendKey, 17099, plist, false, 18099)
+	err = os.WriteFile(dir+"/config.toml", configData, 0o600)
+	if err != nil {
+		panic(err)
+	}
+	err = os.WriteFile(dir+"/genesis.json", genesisData, 0644)
+	if err != nil {
+		panic(err)
+	}
+
+	referenceNode := nodes[1].Host
+	info := testGetGraphInfo(nodes[0].Host)
+	cst := testGetSnapshotSoleTransaction(referenceNode, info.Consensus.String())
+	testWaitTransactionsVisibleOnNodes(t, nodes, []crypto.Hash{cst})
+	raw, _ := json.Marshal(map[string]any{
+		"version": 5,
+		"asset":   "a99c2e0e2b1da4d648755ef19bd95139acbbe6564cfb06dec7cd34931ca72cdc",
+		"inputs": []map[string]any{{
+			"hash":  input,
+			"index": NODES,
+		}},
+		"outputs": []map[string]any{{
+			"type":   common.OutputTypeNodePledge,
+			"amount": "13439",
+		}},
+		"extra":      signer.PublicSpendKey.String() + payee.PublicSpendKey.String(),
+		"references": []crypto.Hash{cst},
+	})
+
+	tx, err := testSignTransaction(referenceNode, domain, string(raw))
+	require.Nil(err)
+	ver := tx.AsVersioned()
+	testSendTransactionsToNodesWithRetry(t, nodes, []*common.VersionedTransaction{ver})
+
+	custom, err := config.Initialize(dir + "/config.toml")
+	require.Nil(err)
+	gns, err := common.ReadGenesis(dir + "/genesis.json")
+	require.Nil(err)
+	cache := newCache(custom)
+	store, err := storage.NewBadgerStore(custom, dir)
+	require.Nil(err)
+	require.NotNil(store)
+	pnode, err := kernel.SetupNode(custom, store, cache, gns)
+	require.Nil(err)
+	require.NotNil(pnode)
+	go func() { _ = pnode.Loop() }()
+
+	server := NewServer(custom, store, pnode, 18099)
+	go func() { _ = server.ListenAndServe() }()
+
+	return Node{Signer: signer, Payee: payee, Host: "127.0.0.1:18099"}, pnode, server
+}
+
+type testSpendableInput struct {
+	Input  *common.Input
+	Amount common.Integer
+}
+
+func testMakeSpendableInputs(utxos []*common.VersionedTransaction) []testSpendableInput {
+	inputs := make([]testSpendableInput, 0, len(utxos))
+	for _, tx := range utxos {
+		inputs = append(inputs, testSpendableInput{
+			Input:  &common.Input{Hash: tx.PayloadHash(), Index: 0},
+			Amount: tx.Outputs[0].Amount,
+		})
+	}
+	return inputs
+}
+
+func testConsolidateSpendableInputs(t *testing.T, nodes []*Node, domain common.Address, inputs []testSpendableInput) ([]testSpendableInput, int) {
+	require := require.New(t)
+	transactions := 0
+	for len(inputs) > common.SliceCountLimit {
+		t.Logf("CONSOLIDATE %d INPUTS INTO %d TRANSACTIONS\n", len(inputs), (len(inputs)+common.SliceCountLimit-1)/common.SliceCountLimit)
+
+		next := make([]testSpendableInput, 0, (len(inputs)+common.SliceCountLimit-1)/common.SliceCountLimit)
+		vers := make([]*common.VersionedTransaction, 0, cap(next))
+		for start := 0; start < len(inputs); start += common.SliceCountLimit {
+			end := start + common.SliceCountLimit
+			end = min(end, len(inputs))
+
+			chunk := inputs[start:end]
+			rawInputs := make([]map[string]any, 0, len(chunk))
+			total := common.Zero
+			for _, in := range chunk {
+				rawInputs = append(rawInputs, map[string]any{
+					"hash":  in.Input.Hash.String(),
+					"index": in.Input.Index,
+				})
+				total = total.Add(in.Amount)
+			}
+
+			raw, _ := json.Marshal(map[string]any{
+				"version": 2,
+				"asset":   common.XINAssetId,
+				"inputs":  rawInputs,
+				"outputs": []map[string]any{{
+					"type":     0,
+					"amount":   total,
+					"script":   "fffe01",
+					"accounts": []string{domain.String()},
+				}},
+			})
+			tx, err := testSignTransaction(nodes[0].Host, domain, string(raw))
+			require.Nil(err)
+			ver := common.VersionedTransaction{SignedTransaction: *tx}
+			vers = append(vers, &ver)
+			next = append(next, testSpendableInput{
+				Input:  &common.Input{Hash: ver.PayloadHash(), Index: 0},
+				Amount: total,
+			})
+		}
+
+		testSendTransactionsToNodesWithRetry(t, nodes, vers)
+		testWaitTransactionsVisibleOnNodes(t, nodes, testVersionedTransactionHashes(vers))
+		transactions += len(vers)
+		inputs = next
+	}
+
+	return inputs, transactions
+}
+
+func testBuildPledgeInput(t *testing.T, nodes []*Node, domain common.Address, utxos []*common.VersionedTransaction) (string, int, error) {
+	require := require.New(t)
+	spendable := testMakeSpendableInputs(utxos)
+	spendable, transactions := testConsolidateSpendableInputs(t, nodes, domain, spendable)
+
+	inputs := make([]map[string]any, 0, len(spendable))
+	for _, in := range spendable {
+		inputs = append(inputs, map[string]any{
+			"hash":  in.Input.Hash.String(),
+			"index": in.Input.Index,
+		})
+	}
+	outputs := []map[string]any{}
+	for range NODES {
+		outputs = append(outputs, map[string]any{
+			"type":     0,
+			"amount":   common.NewIntegerFromString("3.5").Div(NODES),
+			"script":   "fffe01",
+			"accounts": []string{domain.String()},
+		})
+	}
+	outputs = append(outputs, map[string]any{
+		"type":     0,
+		"amount":   "13439",
+		"script":   "fffe01",
+		"accounts": []string{domain.String()},
+	})
+	raw, _ := json.Marshal(map[string]any{
+		"version": 2,
+		"asset":   "a99c2e0e2b1da4d648755ef19bd95139acbbe6564cfb06dec7cd34931ca72cdc",
+		"inputs":  inputs,
+		"outputs": outputs,
+	})
+	tx, err := testSignTransaction(nodes[0].Host, domain, string(raw))
+	require.Nil(err)
+	ver := common.VersionedTransaction{SignedTransaction: *tx}
+	testSendTransactionsToNodesWithRetry(t, nodes, []*common.VersionedTransaction{&ver})
+	testWaitTransactionsVisibleOnNodes(t, nodes, []crypto.Hash{ver.PayloadHash()})
+	return ver.PayloadHash().String(), transactions + 1, err
+}
+
+func testSendTransactionsToNodesWithRetry(t *testing.T, nodes []*Node, vers []*common.VersionedTransaction) {
+	require := require.New(t)
+
+	obs := txObserver
+	var wg sync.WaitGroup
+	for _, ver := range vers {
+		hash := ver.PayloadHash()
+		raw := hex.EncodeToString(ver.Marshal())
+		wg.Go(func() {
+			node := nodes[int(time.Now().UnixNano())%len(nodes)].Host
+			obs.markSend(hash, time.Now())
+			id, err := testSendTransaction(node, raw)
+			require.Nil(err)
+			require.True(id.HasValue())
+		})
+	}
+	// Start observing while submissions are still in flight so large batches
+	// do not make early finalizations look as slow as the final RPC request.
+	obs.observe(nodes, vers)
+	wg.Wait()
+	time.Sleep(3 * time.Second)
+
+	var missingTxs []*common.VersionedTransaction
+	for _, ver := range vers {
+		node := nodes[int(time.Now().UnixNano())%len(nodes)].Host
+		_, snap, err := GetTransaction("http://"+node, ver.PayloadHash().String())
+		require.Nil(err)
+		hash, _ := crypto.HashFromString(snap)
+		if hash.HasValue() {
+			continue
+		}
+		missingTxs = append(missingTxs, ver)
+	}
+	if len(missingTxs) == 0 {
+		return
+	}
+	t.Logf("TX PENDING %d AT %s\n", len(missingTxs), time.Now())
+	testSendTransactionsToNodesWithRetry(t, nodes, missingTxs)
+}
+
+// observe polls each tracked transaction on a deterministic node and records
+// when that node exposes its snapshot. A hash may be passed here repeatedly by
+// the retry helper, but observing ensures that only one poller owns it.
+func (o *txLatencyObserver) observe(nodes []*Node, vers []*common.VersionedTransaction) {
+	seen := make(map[crypto.Hash]bool)
+	pending := make([]crypto.Hash, 0, len(vers))
+	for _, ver := range vers {
+		h := ver.PayloadHash()
+		if seen[h] {
+			continue
+		}
+		seen[h] = true
+		if o.claim(h) {
+			pending = append(pending, h)
+		}
+	}
+	if len(pending) == 0 {
+		return
+	}
+	o.wg.Go(func() {
+		claimed := append([]crypto.Hash(nil), pending...)
+		defer func() {
+			for _, hash := range claimed {
+				o.observing.Delete(hash)
+			}
+		}()
+
+		deadline := time.Now().Add(testStateSyncTimeout)
+		for len(pending) > 0 && time.Now().Before(deadline) {
+			select {
+			case <-o.stop:
+				return
+			default:
+			}
+			sweepStart := time.Now()
+			workers := min(16, len(pending))
+			missing := make([][]crypto.Hash, workers)
+			var wg sync.WaitGroup
+			for w := range workers {
+				from := w * len(pending) / workers
+				to := (w + 1) * len(pending) / workers
+				chunk := pending[from:to]
+				wg.Go(func() {
+					for _, h := range chunk {
+						if _, ok := o.tracked.Load(h); !ok {
+							continue
+						}
+						node := nodes[int(h[0])%len(nodes)].Host
+						_, snap, err := GetTransaction("http://"+node, h.String())
+						if err == nil {
+							if sh, _ := crypto.HashFromString(snap); sh.HasValue() {
+								if at, ok := o.sendTimes.Load(h); ok {
+									o.latencies.LoadOrStore(h, time.Since(at.(time.Time)))
+									continue
+								}
+							}
+						}
+						missing[w] = append(missing[w], h)
+					}
+				})
+			}
+			wg.Wait()
+			o.recordMaxSweep(time.Since(sweepStart))
+			pending = pending[:0]
+			for _, m := range missing {
+				pending = append(pending, m...)
+			}
+			if len(pending) > 0 {
+				timer := time.NewTimer(txLatencyPollInterval)
+				select {
+				case <-o.stop:
+					timer.Stop()
+					return
+				case <-timer.C:
+				}
+			}
+		}
+	})
+}
+
+func (o *txLatencyObserver) waitFor(hashes []crypto.Hash, timeout time.Duration) int {
+	countObserved := func() int {
+		count := 0
+		for _, hash := range hashes {
+			if _, ok := o.latencies.Load(hash); ok {
+				count++
+			}
+		}
+		return count
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		count := countObserved()
+		if count == len(hashes) {
+			return count
+		}
+		select {
+		case <-o.stop:
+			return count
+		case <-timer.C:
+			return count
+		case <-ticker.C:
+		}
+	}
+}
+
+func testLogTxToSnapshotLatency(t *testing.T, label string, vers []*common.VersionedTransaction) {
+	t.Helper()
+	obs := txObserver
+	defer obs.finish(vers)
+
+	hashes := testVersionedTransactionHashes(vers)
+	slices.SortFunc(hashes, func(a, b crypto.Hash) int {
+		return bytes.Compare(a[:], b[:])
+	})
+	hashes = slices.Compact(hashes)
+	observed := obs.waitFor(hashes, testStateSyncTimeout)
+	if observed != len(hashes) {
+		t.Logf("TX TO SNAPSHOT LATENCY %s incomplete samples=%d/%d; percentiles omitted (poll=%s max-sweep=%s)",
+			label, observed, len(hashes), txLatencyPollInterval, time.Duration(obs.maxSweep.Load()))
+		t.Logf("KERNEL SIDE %s %s", label, kernel.TxSnapshotLatencySummary())
+		return
+	}
+
+	ds := make([]time.Duration, 0, len(hashes))
+	for _, hash := range hashes {
+		if d, ok := obs.latencies.Load(hash); ok {
+			ds = append(ds, d.(time.Duration))
+		}
+	}
+	if len(ds) == 0 {
+		t.Logf("TX TO SNAPSHOT LATENCY %s no samples", label)
+		t.Logf("KERNEL SIDE %s %s", label, kernel.TxSnapshotLatencySummary())
+		return
+	}
+	slices.Sort(ds)
+	var sum time.Duration
+	for _, d := range ds {
+		sum += d
+	}
+	pct := func(p int) time.Duration {
+		idx := (len(ds)*p + 99) / 100
+		idx = max(idx, 1)
+		return ds[idx-1]
+	}
+	t.Logf("TX TO SNAPSHOT LATENCY %s boundary=rpc-send->selected-node-snapshot-visible samples=%d min=%s p50=%s p90=%s p99=%s max=%s avg=%s poll=%s max-sweep=%s",
+		label, len(ds), ds[0], pct(50), pct(90), pct(99), ds[len(ds)-1], sum/time.Duration(len(ds)),
+		txLatencyPollInterval, time.Duration(obs.maxSweep.Load()))
+	t.Logf("KERNEL SIDE %s %s", label, kernel.TxSnapshotLatencySummary())
+}
+
+func testVersionedTransactionHashes(vers []*common.VersionedTransaction) []crypto.Hash {
+	hashes := make([]crypto.Hash, 0, len(vers))
+	for _, ver := range vers {
+		hashes = append(hashes, ver.PayloadHash())
+	}
+	return hashes
+}
+
+func testWaitTransactionsVisibleOnNodes(t *testing.T, nodes []*Node, hashes []crypto.Hash) {
+	require := require.New(t)
+	deadline := time.Now().Add(testStateSyncTimeout)
+	for {
+		missing := make(map[string][]string)
+		for _, hash := range hashes {
+			for _, node := range nodes {
+				ver, _, err := GetTransaction("http://"+node.Host, hash.String())
+				require.Nil(err)
+				if ver != nil {
+					continue
+				}
+				missing[hash.String()] = append(missing[hash.String()], node.Host)
+			}
+		}
+		if len(missing) == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			for hash, hosts := range missing {
+				t.Logf("TX NOT VISIBLE %s %s\n", hash, strings.Join(hosts, ","))
+			}
+			require.FailNow("timed out waiting for transaction propagation")
+		}
+		time.Sleep(time.Second)
+	}
+}
+
+func testSendTransaction(node, raw string) (crypto.Hash, error) {
+	return SendRawTransaction("http://"+node, raw)
+}
+
+func testGetNodeToRemove(networkId crypto.Hash, signers, payees []common.Address, seq int) (common.Address, common.Address) {
+	nodes := make([][2]common.Address, len(signers))
+	for i := range signers {
+		nodes[i] = [2]common.Address{signers[i], payees[i]}
+	}
+	sort.Slice(nodes, func(i, j int) bool {
+		a := nodes[i][0].Hash().ForNetwork(networkId)
+		b := nodes[j][0].Hash().ForNetwork(networkId)
+		return a.String() < b.String()
+	})
+	return nodes[seq][0], nodes[seq][1]
+}
+
+func testDetermineAccountByIndex(i int, role string) common.Address {
+	seed := make([]byte, 64)
+	copy(seed, []byte("TESTNODE#"+role+"#"))
+	seed[63] = byte(i)
+	account := common.NewAddressFromSeed(seed)
+	account.PrivateViewKey = account.PublicSpendKey.DeterministicHashDerive()
+	account.PublicViewKey = account.PrivateViewKey.Public()
+	return account
+}
+
+func setupTestNet(root string, externalRelayers bool) ([]common.Address, []common.Address, []byte, string, []*kernel.Node, []*http.Server) {
+	var signers, payees, custodians []common.Address
+	var relayers []common.Address
+	var relayerInstances []*kernel.Node
+	var relayerServers []*http.Server
+
+	for i := range NODES {
+		signers = append(signers, testDetermineAccountByIndex(i, "SIGNER"))
+		payees = append(payees, testDetermineAccountByIndex(i, "PAYEE"))
+		custodians = append(custodians, testDetermineAccountByIndex(i, "CUSTODIAN"))
+		relayers = append(relayers, testDetermineAccountByIndex(i, "RELAYER"))
+	}
+
+	inputs := make([]map[string]string, 0)
+	for i := range signers {
+		inputs = append(inputs, map[string]string{
+			"signer":    signers[i].String(),
+			"payee":     payees[i].String(),
+			"custodian": custodians[i].String(),
+			"balance":   "13439",
+		})
+	}
+
+	domain := signers[0]
+	genesis := map[string]any{
+		"epoch":     1551312000,
+		"nodes":     inputs,
+		"custodian": domain.String(),
+	}
+	genesisData, err := json.MarshalIndent(genesis, "", "  ")
+	if err != nil {
+		panic(err)
+	}
+	var gns common.Genesis
+	err = json.Unmarshal(genesisData, &gns)
+	if err != nil {
+		panic(err)
+	}
+
+	peers := make([]string, len(signers))
+	for i, s := range signers {
+		id := s.Hash().ForNetwork(gns.NetworkId())
+		peers[i] = fmt.Sprintf("%s@127.0.0.1:170%02d", id.String(), i+1)
+	}
+	peersListHead := `"` + strings.Join(peers[:len(peers)/3], `","`) + `"`
+	peersListTail := `"` + strings.Join(peers[len(peers)/2:], `","`) + `"`
+
+	if externalRelayers {
+		peers := make([]string, len(relayers))
+		for i, s := range relayers {
+			id := s.Hash().ForNetwork(gns.NetworkId())
+			peers[i] = fmt.Sprintf("%s@127.0.0.1:160%02d", id.String(), i+1)
+		}
+		peersListHead = `"` + strings.Join(peers[:len(peers)/3], `","`) + `"`
+		peersListTail = `"` + strings.Join(peers[len(peers)/2:], `","`) + `"`
+		for i, a := range relayers {
+			dir := fmt.Sprintf("%s/mixin-160%02d", root, i+1)
+			err := os.MkdirAll(dir, 0755)
+			if err != nil {
+				panic(err)
+			}
+
+			rpcPort := 26000 + i + 1
+			configData := fmt.Appendf(nil, configDataTmpl, a.PrivateSpendKey, 16000+i+1, peersListHead, true, rpcPort)
+			err = os.WriteFile(dir+"/config.toml", configData, 0o600)
+			if err != nil {
+				panic(err)
+			}
+			err = os.WriteFile(dir+"/genesis.json", genesisData, 0644)
+			if err != nil {
+				panic(err)
+			}
+			gns, _ := common.ReadGenesis(dir + "/genesis.json")
+			custom, _ := config.Initialize(dir + "/config.toml")
+			cache := newCache(custom)
+			store, _ := storage.NewBadgerStore(custom, dir)
+			node, _ := kernel.SetupNode(custom, store, cache, gns)
+
+			server := NewServer(custom, store, node, rpcPort)
+			relayerInstances = append(relayerInstances, node)
+			relayerServers = append(relayerServers, server)
+			go func() { _ = server.ListenAndServe() }()
+			go func() { _ = node.Loop() }()
+		}
+	}
+
+	for i, a := range signers {
+		dir := fmt.Sprintf("%s/mixin-170%02d", root, i+1)
+		err := os.MkdirAll(dir, 0755)
+		if err != nil {
+			panic(err)
+		}
+
+		peersList := peersListHead
+		if i > len(signers)/2 {
+			peersList = peersListTail
+		}
+		port := 17000 + i + 1
+		p2p := fmt.Sprint(port)
+		isRelayer := !externalRelayers && (strings.Contains(peersListHead, p2p) || strings.Contains(peersListTail, p2p))
+		if isRelayer {
+			peersList = peersListHead
+		}
+		configData := fmt.Appendf(nil, configDataTmpl, a.PrivateSpendKey, port, peersList, isRelayer, 18000+i+1)
+		err = os.WriteFile(dir+"/config.toml", configData, 0o600)
+		if err != nil {
+			panic(err)
+		}
+		err = os.WriteFile(dir+"/genesis.json", genesisData, 0644)
+		if err != nil {
+			panic(err)
+		}
+	}
+	return signers, payees, genesisData, peersListHead, relayerInstances, relayerServers
+}
+
+func testSignTransaction(node string, account common.Address, rawStr string) (*common.SignedTransaction, error) {
+	var raw signerInput
+	err := json.Unmarshal([]byte(rawStr), &raw)
+	if err != nil {
+		panic(err)
+	}
+	raw.Node = node
+
+	tx := common.NewTransactionV5(raw.Asset)
+	for _, in := range raw.Inputs {
+		if d := in.Deposit; d != nil {
+			tx.AddDepositInput(&common.DepositData{
+				Chain:       d.Chain,
+				AssetKey:    d.AssetKey,
+				Transaction: d.TransactionHash,
+				Index:       d.OutputIndex,
+				Amount:      d.Amount,
+			})
+		} else {
+			tx.AddInput(in.Hash, in.Index)
+		}
+	}
+
+	for _, out := range raw.Outputs {
+		if out.Mask.HasValue() {
+			panic("not here")
+		}
+		hash := crypto.Blake3Hash([]byte(rawStr))
+		seed := append(hash[:], hash[:]...)
+		tx.AddOutputWithType(out.Type, out.Accounts, out.Script, out.Amount, seed)
+	}
+
+	extra, err := hex.DecodeString(raw.Extra)
+	if err != nil {
+		panic(err)
+	}
+	tx.Extra = extra
+	tx.References = raw.References
+
+	signed := &common.SignedTransaction{Transaction: *tx}
+	for i := range signed.Inputs {
+		err := signed.SignInput(raw, i, []*common.Address{&account})
+		if err != nil {
+			return nil, err
+		}
+	}
+	return signed, nil
+}
+
+func testVerifyInfoAfter(require *require.Assertions, nodes []*Node, after time.Time) Info {
+	info, _ := testVerifyInfoAfterWithTraffic(nil, require, nodes, common.Address{}, after)
+	return info
+}
+
+// testVerifyInfoAfterWithTraffic waits for the graph timestamp to pass after,
+// and returns the number of driver transactions sent while waiting. The graph
+// only advances when there are transactions to snapshot, exactly like a real
+// deployment that always has traffic: whenever the graph looks stalled, a
+// small unique deposit signed by the current custodian is submitted to keep
+// rounds advancing.
+func testVerifyInfoAfterWithTraffic(t *testing.T, require *require.Assertions, nodes []*Node, custodian common.Address, after time.Time) (Info, int) {
+	drivers := 0
+	deadline := time.Now().Add(testStateSyncTimeout)
+	var info Info
+	var consistent bool
+	var last time.Time
+	stalled := 0
+	for {
+		info, consistent = testCollectConsistentInfo(nodes)
+		if consistent && info.Timestamp.After(after) {
+			return info, drivers
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		if consistent && !info.Timestamp.After(last) {
+			stalled++
+		} else {
+			stalled = 0
+		}
+		last = info.Timestamp
+		if t != nil && stalled >= 2 && custodian.PrivateSpendKey.HasValue() {
+			raw := fmt.Sprintf(`{"version":5,"asset":"a99c2e0e2b1da4d648755ef19bd95139acbbe6564cfb06dec7cd34931ca72cdc","inputs":[{"deposit":{"chain":"8dd50817c082cdcdd6f167514928767a4b52426997bd6d4930eca101c5ff8a27","asset_key":"0xa974c709cfb4566686553a20790685a47aceaa33","transaction":"0xd7c1132b58e1f64c263957d7857fe5ec5294fce95d30dcd64efef71da1%06d","index":0,"amount":"0.0001"}}],"outputs":[{"type":0,"amount":"0.0001","script":"fffe01","accounts":["%s"]}]}`, testDriverTransactionSeq, custodian.String())
+			testDriverTransactionSeq++
+			tx, err := testSignTransaction(nodes[int(time.Now().UnixNano())%len(nodes)].Host, custodian, raw)
+			require.Nil(err)
+			ver := &common.VersionedTransaction{SignedTransaction: *tx}
+			t.Logf("GRAPH DRIVER SEND %s AT %s AFTER %s\n", ver.PayloadHash(), time.Now(), after)
+			testSendTransactionsToNodesWithRetry(t, nodes, []*common.VersionedTransaction{ver})
+			drivers++
+			stalled = 0
+		}
+		time.Sleep(time.Second)
+	}
+	require.Truef(consistent, "graph info should converge within %s", testStateSyncTimeout)
+	require.Truef(info.Timestamp.After(after), "%s should after %s", info.Timestamp, after)
+	return info, drivers
+}
+
+var testDriverTransactionSeq = 1000000
+
+func testCollectConsistentInfo(nodes []*Node) (Info, bool) {
+	info := testGetGraphInfo(nodes[0].Host)
+	consistent := true
+	for _, n := range nodes[1:] {
+		a := testGetGraphInfo(n.Host)
+		if info.PoolSize.Cmp(a.PoolSize) != 0 {
+			consistent = false
+			break
+		}
+	}
+	return info, consistent
+}
+
+func testVerifyDeposits(require *require.Assertions, nodes []*Node, deposits []*common.VersionedTransaction) {
+	for _, dt := range deposits {
+		dd := dt.DepositData()
+		for _, n := range nodes {
+			tx, _, _ := GetDepositTransaction("http://"+n.Host, dd.Chain.String(), dd.Transaction, dd.Index)
+			id := tx.Inputs[0].Deposit
+			require.Equal(dd.Amount, id.Amount)
+			require.Equal(dd.Chain, id.Chain)
+			require.Equal(dd.AssetKey, id.AssetKey)
+			require.Equal(dd.Transaction, id.Transaction)
+			require.Equal(dd.Index, id.Index)
+			require.Equal(tx.PayloadHash(), dt.PayloadHash())
+		}
+	}
+}
+
+func testVerifySnapshots(require *require.Assertions, nodes []*Node, expectedTransactions int) (map[string]bool, map[string]bool) {
+	var filters []map[string]*common.Snapshot
+	var txs, snapshots map[string]bool
+	deadline := time.Now().Add(testStateSyncTimeout)
+	for {
+		filters = make([]map[string]*common.Snapshot, 0, len(nodes))
+		for _, n := range nodes {
+			filters = append(filters, testListSnapshots(n.Host))
+		}
+		txs, snapshots = collectSnapshotSets(filters)
+		consistent := true
+		for i := range len(filters) - 1 {
+			if !snapshotKeysEqual(filters[i], filters[i+1]) {
+				consistent = false
+				break
+			}
+		}
+		if consistent && len(txs) == expectedTransactions || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(time.Second)
+	}
+	for i := range len(filters) - 1 {
+		a, b := filters[i], filters[i+1]
+		m, n := make(map[string]bool), make(map[string]bool)
+		for k := range a {
+			for _, txh := range a[k].Transactions {
+				m[txh.String()] = true
+			}
+		}
+		for k := range b {
+			for _, txh := range b[k].Transactions {
+				n[txh.String()] = true
+			}
+		}
+		requireKeyEqual(require, a, b)
+		require.Equal(len(a), len(b))
+		require.Equal(len(m), len(n))
+		require.Equal(len(filters[i]), len(filters[i+1]))
+	}
+	return txs, snapshots
+}
+
+func snapshotKeysEqual(a, b map[string]*common.Snapshot) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k := range a {
+		if _, ok := b[k]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func collectSnapshotSets(filters []map[string]*common.Snapshot) (map[string]bool, map[string]bool) {
+	txs, snapshots := make(map[string]bool), make(map[string]bool)
+	for _, filter := range filters {
+		for k, snapshot := range filter {
+			snapshots[k] = true
+			for _, txh := range snapshot.Transactions {
+				txs[txh.String()] = true
+			}
+		}
+	}
+	return txs, snapshots
+}
+
+func requireKeyEqual(require *require.Assertions, a, b map[string]*common.Snapshot) {
+	var as, bs []string
+	for k := range a {
+		as = append(as, k)
+	}
+	for k := range b {
+		bs = append(bs, k)
+	}
+	slices.Sort(as)
+	slices.Sort(bs)
+	require.Equal(len(as), len(bs))
+	require.True(strings.Join(as, "") == strings.Join(bs, ""))
+}
+
+func testListSnapshots(node string) map[string]*common.Snapshot {
+	info := testGetGraphInfo(node)
+	type rpcSnapshot struct {
+		Version      uint8                 `json:"version"`
+		NodeId       crypto.Hash           `json:"node"`
+		RoundNumber  uint64                `json:"round"`
+		References   *common.RoundLink     `json:"references"`
+		Timestamp    uint64                `json:"timestamp"`
+		Transactions []crypto.Hash         `json:"transactions"`
+		Signature    *crypto.CosiSignature `json:"signature"`
+		Hash         crypto.Hash           `json:"hash"`
+		Topology     uint64                `json:"topology"`
+	}
+	var rss []*rpcSnapshot
+	for offset := uint64(0); ; {
+		data, err := CallMixinRPC("http://"+node, "listsnapshots", []any{
+			offset,
+			500,
+			false,
+			false,
+		})
+		if err != nil {
+			panic(err)
+		}
+		var page []*rpcSnapshot
+		if err := json.Unmarshal(data, &page); err != nil {
+			panic(err)
+		}
+		rss = append(rss, page...)
+		if len(page) < 500 {
+			break
+		}
+		next := page[len(page)-1].Topology + 1
+		if next <= offset {
+			panic(fmt.Errorf("invalid snapshot topology pagination %d %d", offset, next))
+		}
+		offset = next
+	}
+	filter := make(map[string]*common.Snapshot)
+	snapshots := make([]*common.Snapshot, len(rss))
+	rounds := make(map[string]int)
+	var sc, tc int
+	for i, s := range rss {
+		snapshots[i] = &common.Snapshot{
+			Version:      s.Version,
+			NodeId:       s.NodeId,
+			RoundNumber:  s.RoundNumber,
+			References:   s.References,
+			Timestamp:    s.Timestamp,
+			Transactions: s.Transactions,
+			Signature:    s.Signature,
+		}
+		switch s.Version {
+		case 2:
+			snapshots[i].Signature = s.Signature
+		default:
+			panic(s.Version)
+		}
+		filter[s.Hash.String()] = snapshots[i]
+		if s.NodeId == info.Node {
+			rounds[fmt.Sprintf("%s:%d", s.NodeId, s.RoundNumber)]++
+			tc += len(s.Transactions)
+			sc++
+		}
+	}
+	if sc > 0 {
+		fmt.Printf("SNAPSHOT STATS %s snapshots=%d rounds=%d avg_snapshots_per_round=%.2f avg_transactions_per_snapshot=%.2f\n",
+			node, sc, len(rounds), float64(sc)/float64(len(rounds)), float64(tc)/float64(sc))
+	}
+	return filter
+}
+
+type Node struct {
+	Signer      common.Address `json:"signer"`
+	Payee       common.Address `json:"payee"`
+	State       string         `json:"state"`
+	Transaction crypto.Hash    `json:"transaction"`
+	Host        string         `json:"-"`
+}
+
+func testListNodes(node string) []*Node {
+	data, err := CallMixinRPC("http://"+node, "listallnodes", []any{time.Now().UnixNano() * 2, false})
+	if err != nil {
+		panic(err)
+	}
+	var nodes []*Node
+	err = json.Unmarshal(data, &nodes)
+	if err != nil {
+		panic(err)
+	}
+	return nodes
+}
+
+func testListNodesUntilState(t *testing.T, node string, signer common.Address, state string, timeout time.Duration) []*Node {
+	deadline := time.Now().Add(timeout)
+	nextLog := time.Now().Add(15 * time.Second)
+	var nodes []*Node
+	for {
+		nodes = testListNodes(node)
+		current := ""
+		for _, n := range nodes {
+			if n.Signer.String() != signer.String() {
+				continue
+			}
+			current = n.State
+			if n.State == state {
+				return nodes
+			}
+		}
+		if time.Now().After(nextLog) {
+			t.Logf("WAIT NODE STATE %s %s CURRENT %s\n", signer, state, current)
+			nextLog = time.Now().Add(15 * time.Second)
+		}
+		if time.Now().After(deadline) {
+			t.Logf("WAIT NODE STATE %s %s TIMEOUT CURRENT %s\n", signer, state, current)
+			return nodes
+		}
+		time.Sleep(time.Second)
+	}
+}
+
+type HeadRound struct {
+	Node  crypto.Hash `json:"node"`
+	Round uint64      `json:"round"`
+	Hash  crypto.Hash `json:"hash"`
+}
+
+func testDumpGraphHead(node string, id crypto.Hash) *HeadRound {
+	data, err := CallMixinRPC("http://"+node, "dumpgraphhead", []any{})
+	if err != nil {
+		panic(err)
+	}
+	var head []*HeadRound
+	err = json.Unmarshal(data, &head)
+	if err != nil {
+		panic(err)
+	}
+	for _, r := range head {
+		if r.Node == id {
+			return r
+		}
+	}
+	return nil
+}
+
+func testDumpGraphHeadRoundAfter(node string, id crypto.Hash, round uint64) *HeadRound {
+	deadline := time.Now().Add(testStateSyncTimeout)
+	for {
+		hr := testDumpGraphHead(node, id)
+		if hr != nil && hr.Round > round {
+			return hr
+		}
+		if time.Now().After(deadline) {
+			return hr
+		}
+		time.Sleep(time.Second)
+	}
+}
+
+type Info struct {
+	Node      crypto.Hash
+	Consensus crypto.Hash
+	Timestamp time.Time
+	PoolSize  common.Integer
+}
+
+func testGetGraphInfo(node string) Info {
+	data, err := CallMixinRPC("http://"+node, "getinfo", []any{})
+	if err != nil {
+		panic(err)
+	}
+	var info struct {
+		Node      crypto.Hash `json:"node"`
+		Consensus crypto.Hash `json:"consensus"`
+		Timestamp string      `json:"timestamp"`
+		Mint      struct {
+			PoolSize common.Integer `json:"pool"`
+		} `json:"mint"`
+	}
+	err = json.Unmarshal(data, &info)
+	if err != nil {
+		panic(err)
+	}
+	t, err := time.Parse(time.RFC3339Nano, info.Timestamp)
+	if err != nil {
+		panic(err)
+	}
+	return Info{
+		Node:      info.Node,
+		Consensus: info.Consensus,
+		Timestamp: t,
+		PoolSize:  info.Mint.PoolSize,
+	}
+}
+
+func testGetSnapshotSoleTransaction(node, hash string) crypto.Hash {
+	data, err := CallMixinRPC("http://"+node, "getsnapshot", []any{hash})
+	if err != nil {
+		panic(err)
+	}
+	var info struct {
+		Transactions []struct {
+			Hash crypto.Hash `json:"hash"`
+		} `json:"transactions"`
+	}
+	err = json.Unmarshal(data, &info)
+	if err != nil {
+		panic(string(data))
+	}
+	return info.Transactions[0].Hash
+}
+
+func testListMintDistributions(node string) []*common.VersionedTransaction {
+	vers, err := ListMintDistributions("http://"+node, 0, 10)
+	if err != nil {
+		panic(err)
+	}
+	return vers
+}
+
+type signerInput struct {
+	Inputs []struct {
+		Hash    crypto.Hash `json:"hash"`
+		Index   uint        `json:"index"`
+		Deposit *struct {
+			Chain           crypto.Hash    `json:"chain"`
+			AssetKey        string         `json:"asset_key"`
+			TransactionHash string         `json:"transaction"`
+			OutputIndex     uint64         `json:"index"`
+			Amount          common.Integer `json:"amount"`
+		} `json:"deposit,omitempty"`
+		Keys []*crypto.Key `json:"keys"`
+		Mask crypto.Key    `json:"mask"`
+	} `json:"inputs"`
+	Outputs []struct {
+		Type     uint8             `json:"type"`
+		Mask     crypto.Key        `json:"mask"`
+		Keys     []*crypto.Key     `json:"keys"`
+		Amount   common.Integer    `json:"amount"`
+		Script   common.Script     `json:"script"`
+		Accounts []*common.Address `json:"accounts"`
+	}
+	Asset      crypto.Hash   `json:"asset"`
+	Extra      string        `json:"extra"`
+	References []crypto.Hash `json:"references"`
+	Node       string        `json:"-"`
+}
+
+func (raw signerInput) ReadUTXOKeys(hash crypto.Hash, index uint) (*common.UTXOKeys, error) {
+	utxo := &common.UTXOKeys{}
+
+	for _, in := range raw.Inputs {
+		if in.Hash == hash && in.Index == index && len(in.Keys) > 0 {
+			utxo.Keys = in.Keys
+			utxo.Mask = in.Mask
+			return utxo, nil
+		}
+	}
+
+	out, err := GetUTXO("http://"+raw.Node, hash.String(), uint64(index))
+	if err != nil {
+		return nil, err
+	}
+	if out.Amount.Sign() == 0 {
+		return nil, fmt.Errorf("invalid input %s#%d", hash.String(), index)
+	}
+	utxo.Keys = out.Keys
+	utxo.Mask = out.Mask
+	return utxo, nil
+}
+
+func electSnapshotNode(nodes []*Node, node *kernel.Node, operation byte, now uint64) *Node {
+	switch operation {
+	case common.TransactionTypeMint:
+	case common.TransactionTypeNodeRemove:
+	case common.TransactionTypeNodePledge:
+	case common.TransactionTypeCustodianUpdateNodes:
+	case common.TransactionTypeCustodianSlashNodes:
+	}
+	accepted := node.NodesListWithoutState(now, false)
+	if len(accepted) < config.KernelMinimumNodesCount {
+		panic(len(accepted))
+	}
+	accepted = accepted[1 : len(accepted)-1]
+	day := int((now - node.Epoch) / (uint64(time.Hour) * 24))
+	idx := (day + int(operation)) % len(accepted)
+	eid := accepted[idx].IdForNetwork
+	for _, n := range nodes {
+		if n.Signer.Hash().ForNetwork(node.NetworkId()) == eid {
+			return n
+		}
+	}
+	return nil
+}
+
+func newCache(conf *config.Custom) *ristretto.Cache[[]byte, any] {
+	cache, err := ristretto.NewCache(&ristretto.Config[[]byte, any]{
+		NumCounters: 1e7, // number of keys to track frequency of (10M).
+		MaxCost:     int64(conf.Node.MemoryCacheSize) * 1024 * 1024,
+		BufferItems: 64, // number of keys per Get buffer.
+	})
+	if err != nil {
+		panic(err)
+	}
+	return cache
+}

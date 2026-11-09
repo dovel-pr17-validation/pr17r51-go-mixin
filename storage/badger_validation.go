@@ -1,0 +1,178 @@
+package storage
+
+import (
+	"bytes"
+	"encoding/binary"
+	"encoding/hex"
+	"fmt"
+	"slices"
+	"sort"
+	"time"
+
+	"github.com/MixinNetwork/mixin/common"
+	"github.com/MixinNetwork/mixin/config"
+	"github.com/MixinNetwork/mixin/crypto"
+	"github.com/MixinNetwork/mixin/logger"
+)
+
+func (s *BadgerStore) ValidateGraphEntries(networkId crypto.Hash, depth uint64) (int, int, error) {
+	nodes := s.ReadAllNodes(uint64(time.Now().UnixNano()), false)
+	type result struct {
+		total, invalid int
+		err            error
+	}
+	results := make(chan result, len(nodes))
+	for _, n := range nodes {
+		go func(nodeId crypto.Hash) {
+			total, invalid, err := s.validateSnapshotEntriesForNode(nodeId, depth)
+			if err != nil {
+				logger.Printf("SNAPSHOT VALIDATION ERROR FOR NODE %s %s\n", nodeId, err.Error())
+			}
+			results <- result{total, invalid, err}
+		}(n.IdForNetwork(networkId))
+	}
+	var total, invalid int
+	var err error
+	for range nodes {
+		res := <-results
+		total += res.total
+		invalid += res.invalid
+		if err == nil {
+			err = res.err
+		}
+	}
+	return total, invalid, err
+}
+
+func (s *BadgerStore) validateSnapshotEntriesForNode(nodeId crypto.Hash, depth uint64) (int, int, error) {
+	logger.Printf("SNAPSHOT VALIDATE NODE %s BEGIN\n", nodeId)
+	txn := s.snapshotsDB.NewTransaction(false)
+	defer func() {
+		txn.Discard()
+		logger.Printf("SNAPSHOT VALIDATE NODE %s DONE\n", nodeId)
+	}()
+
+	head, err := readRound(txn, nodeId)
+	if err != nil {
+		return 0, 0, err
+	}
+	if head == nil {
+		logger.Printf("SNAPSHOT VALIDATE NODE %s 0 ROUND\n", nodeId)
+		return 0, 0, nil
+	}
+
+	logger.Printf("SNAPSHOT VALIDATE NODE %s %d ROUNDS\n", nodeId, head.Number)
+	start := head.Number - depth
+	if head.Number < depth {
+		start = 0
+	}
+	invalid, total := 0, 0
+	for i := start; i < head.Number; i++ {
+		snapshots, err := readSnapshotsForNodeRound(txn, nodeId, i)
+		if err != nil {
+			return total, invalid, err
+		}
+		if len(snapshots) == 0 {
+			return total, invalid, fmt.Errorf("missing snapshots for node %s round %d", nodeId, i)
+		}
+		for _, s := range snapshots {
+			for _, txh := range s.Transactions {
+				total += 1
+				item, err := txn.Get(graphTransactionKey(txh))
+				if err != nil {
+					return total, invalid, err
+				}
+				val, err := item.ValueCopy(nil)
+				if err != nil {
+					return total, invalid, err
+				}
+				ver, err := common.UnmarshalVersionedTransaction(val)
+				if err != nil {
+					return total, invalid, err
+				}
+				if txh != ver.PayloadHash() {
+					logger.Printf("MALFORMED TRANSACTION %s %s %#v\n", txh, ver.PayloadHash(), ver)
+					invalid += 1
+				}
+				item, err = txn.Get(graphFinalizationKey(txh))
+				if err != nil {
+					return total, invalid, err
+				}
+				val, err = item.ValueCopy(nil)
+				if err != nil {
+					return total, invalid, err
+				}
+				if s.Hash.String() != hex.EncodeToString(val) {
+					logger.Printf("DUPLICATED FINALIZATION %s %s\n", s.Hash, hex.EncodeToString(val))
+				}
+				dup, err := crypto.HashFromString(hex.EncodeToString(val))
+				if err != nil {
+					return total, invalid, fmt.Errorf("malformed finalization for transaction %s: %w", txh, err)
+				}
+				topo, err := readSnapshotWithTopo(txn, dup)
+				if err != nil {
+					return total, invalid, err
+				}
+				if topo == nil {
+					return total, invalid, fmt.Errorf("missing finalization snapshot %s for transaction %s", dup, txh)
+				}
+				if !slices.Contains(topo.Transactions, txh) {
+					logger.Printf("MALFORMED FINALIZATION %s %s\n", s.Hash, topo.Hash)
+					invalid += 1
+				}
+			}
+		}
+		_, _, hash := computeRoundHash(nodeId, i, snapshots)
+		round, err := readRound(txn, hash)
+		if err != nil {
+			return total, invalid, err
+		}
+		if round == nil {
+			logger.Printf("MISSING ROUND %s %d %s\n", nodeId, i, hash)
+			invalid += 1
+		} else if round.NodeId != nodeId || round.Number != i {
+			logger.Printf("MALFORMED ROUND %s %d %s %s %d\n", nodeId, i, hash, round.NodeId, round.Number)
+			invalid += 1
+		}
+	}
+	return total, invalid, nil
+}
+
+func computeRoundHash(nodeId crypto.Hash, number uint64, snapshots []*common.SnapshotWithTopologicalOrder) (uint64, uint64, crypto.Hash) {
+	sort.Slice(snapshots, func(i, j int) bool {
+		if snapshots[i].Timestamp < snapshots[j].Timestamp {
+			return true
+		}
+		if snapshots[i].Timestamp > snapshots[j].Timestamp {
+			return false
+		}
+		a, b := snapshots[i].Hash, snapshots[j].Hash
+		return bytes.Compare(a[:], b[:]) < 0
+	})
+	start := snapshots[0].Timestamp
+	end := snapshots[len(snapshots)-1].Timestamp
+	if end >= start+config.SnapshotRoundGap {
+		err := fmt.Errorf("ComputeRoundHash(%s, %d) %d %d %d", nodeId, number, start, end, start+config.SnapshotRoundGap)
+		panic(err)
+	}
+
+	version := snapshots[0].Version
+	for _, s := range snapshots {
+		if s.Version > version {
+			version = s.Version
+		}
+	}
+
+	buf := binary.BigEndian.AppendUint64(nodeId[:], number)
+	hash := crypto.Blake3Hash(buf)
+	for _, s := range snapshots {
+		if s.Version > version {
+			panic(nodeId)
+		}
+		if s.Timestamp > end {
+			panic(nodeId)
+		}
+		hash = crypto.Blake3Hash(append(hash[:], s.Hash[:]...))
+	}
+	return start, end, hash
+}
